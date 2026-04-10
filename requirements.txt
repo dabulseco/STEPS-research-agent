@@ -7,9 +7,13 @@ langchain>=0.1.0
 langchain-community>=0.0.20
 langchain-core>=0.1.0
 langchain-ollama>=0.1.0
+langchain-text-splitters>=0.2.0
 ollama>=0.1.0
 openai>=1.70.0,<2.0.0
 litellm>=1.0.0,<2.0.0
+
+# Vector store and RAG
+chromadb>=0.5.0
 
 # Web Search and Scraping
 duckduckgo-search>=5.0.0

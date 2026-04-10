@@ -1,4 +1,5 @@
 import os
+import uuid
 import warnings
 
 # CRITICAL: Set environment variables BEFORE importing crewai
@@ -15,6 +16,7 @@ os.environ['CREWAI_STORAGE_DIR'] = './.crewai_storage'
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import streamlit as st
+from rag import DocumentStore, classify_embedding_models
 from crewai import Agent, Task, Crew, Process
 
 try:
@@ -94,6 +96,16 @@ if 'custom_resources' not in st.session_state:
     st.session_state.custom_resources = []  # list[dict] with keys: type, source, title, content
 if 'resource_added_after_stage' not in st.session_state:
     st.session_state.resource_added_after_stage = None
+
+# RAG / ChromaDB state
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = f"sess_{uuid.uuid4().hex[:8]}"
+if 'embed_model' not in st.session_state:
+    st.session_state.embed_model = "nomic-embed-text"
+if 'rag_enabled' not in st.session_state:
+    st.session_state.rag_enabled = True
+if 'research_embedded' not in st.session_state:
+    st.session_state.research_embedded = False
 
 # ---------------------------------------------------------------------------
 # Output format templates
@@ -286,8 +298,20 @@ def build_resources_block() -> str:
 # URL scraping helper
 # ---------------------------------------------------------------------------
 
-def scrape_url(url: str) -> dict[str, str]:
-    """Scrape a URL and return a {title, content} dict."""
+def scrape_url(
+    url: str,
+    doc_store: "DocumentStore | None" = None,
+    collection_name: str = "session",
+    persist_to_library: bool = False,
+) -> dict[str, str]:
+    """Scrape a URL and return a {title, content} dict.
+
+    If *doc_store* is provided the full content is also semantically chunked
+    and embedded into ChromaDB (collection = *collection_name* unless
+    *persist_to_library* is True, in which case it goes into 'library').
+    The returned 'content' retains a 4000-word preview for the legacy
+    prompt-injection fallback path.
+    """
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchAgent/1.0)"}
         resp = requests.get(url, headers=headers, timeout=15)
@@ -300,11 +324,21 @@ def scrape_url(url: str) -> dict[str, str]:
             if soup.title and soup.title.string
             else url
         )
-        text: str = soup.get_text(separator="\n", strip=True)
-        words = text.split()
+        full_text: str = soup.get_text(separator="\n", strip=True)
+
+        # Embed FULL content into ChromaDB (semantic chunking handles size)
+        if doc_store is not None and full_text.strip():
+            target_coll = "library" if persist_to_library else collection_name
+            _try_embed_resource(full_text, url, title, "url", target_coll, doc_store)
+
+        # Keep a 4000-word preview for the legacy truncation fallback
+        words = full_text.split()
         if len(words) > 4000:
-            text = " ".join(words[:4000]) + "\n[... content truncated ...]"
-        return {"title": title, "content": text}
+            preview = " ".join(words[:4000]) + "\n[... content truncated — full text indexed in ChromaDB ...]"
+        else:
+            preview = full_text
+
+        return {"title": title, "content": preview}
     except Exception as exc:
         return {"title": url, "content": f"[Could not scrape URL: {exc}]"}
 
@@ -313,8 +347,19 @@ def scrape_url(url: str) -> dict[str, str]:
 # PDF extraction helper (chunking for large documents)
 # ---------------------------------------------------------------------------
 
-def extract_pdf(file_bytes: bytes, filename: str) -> dict[str, str]:
-    """Extract text from a PDF; chunk large documents into sections."""
+def extract_pdf(
+    file_bytes: bytes,
+    filename: str,
+    doc_store: "DocumentStore | None" = None,
+    collection_name: str = "session",
+    persist_to_library: bool = False,
+) -> dict[str, str]:
+    """Extract text from a PDF; embed full content into ChromaDB when available.
+
+    If *doc_store* is provided the entire extracted text is semantically
+    chunked and embedded (no arbitrary word limit).  The returned 'content'
+    retains a ~4000-word preview for the legacy prompt-injection fallback.
+    """
     try:
         import pdfplumber
         import io as _io
@@ -326,19 +371,20 @@ def extract_pdf(file_bytes: bytes, filename: str) -> dict[str, str]:
                 if t:
                     text_parts.append(t)
         full_text = "\n".join(text_parts)
+
+        # Embed FULL text into ChromaDB (no word-count ceiling)
+        if doc_store is not None and full_text.strip():
+            target_coll = "library" if persist_to_library else collection_name
+            _try_embed_resource(full_text, filename, filename, "pdf", target_coll, doc_store)
+
+        # Build a 4000-word preview for legacy fallback
         words = full_text.split()
-
         if len(words) > 4000:
-            # Split into ~1 000-word chunks (up to 20 chunks = ~20 000 words)
-            chunks: list[str] = []
-            for start in range(0, min(len(words), 20_000), 1_000):
-                chunks.append(" ".join(words[start : start + 1_000]))
-            content = "\n\n[SECTION BREAK]\n\n".join(chunks)
-            content += "\n[Large document — first ~20,000 words shown in sections]"
+            preview = " ".join(words[:4000]) + "\n[Large document — full text indexed in ChromaDB]"
         else:
-            content = full_text
+            preview = full_text
 
-        return {"title": filename, "content": content}
+        return {"title": filename, "content": preview}
     except Exception as exc:
         return {"title": filename, "content": f"[Could not extract PDF: {exc}]"}
 
@@ -349,9 +395,21 @@ def extract_pdf(file_bytes: bytes, filename: str) -> dict[str, str]:
 
 def render_resource_panel() -> None:
     """Render the persistent Research Resources panel in the sidebar."""
+    doc_store = get_document_store(st.session_state.get("embed_model", "nomic-embed-text"))
+    session_id = st.session_state.get("session_id", "default")
+    session_coll = f"session_{session_id}"
+
     st.markdown("---")
     st.markdown("### 📎 Research Resources")
     st.caption("Add URLs or PDFs at any stage. They will be injected into all remaining research and writing steps.")
+
+    # Save-to-library toggle
+    save_to_library = st.checkbox(
+        "💾 Save to persistent library",
+        value=False,
+        key="save_to_library_toggle",
+        help="When checked, the document is also saved to the cross-session library so it is available in future research sessions.",
+    )
 
     # --- URL input ---
     url_input = st.text_input(
@@ -366,8 +424,13 @@ def render_resource_panel() -> None:
             if raw in already:
                 st.warning("This URL is already in the resource list.")
             else:
-                with st.spinner(f"Scraping {raw} …"):
-                    result = scrape_url(raw)
+                with st.spinner(f"Scraping and indexing {raw} …"):
+                    result = scrape_url(
+                        raw,
+                        doc_store=doc_store,
+                        collection_name=session_coll,
+                        persist_to_library=save_to_library,
+                    )
                 st.session_state.custom_resources.append({
                     "type": "url",
                     "source": raw,
@@ -378,7 +441,8 @@ def render_resource_panel() -> None:
                 stage = st.session_state.workflow_stage
                 if stage > 0:
                     st.session_state.resource_added_after_stage = stage
-                st.success(f"Added: {result['title']}")
+                lib_note = " + saved to library" if save_to_library else ""
+                st.success(f"Added{lib_note}: {result['title']}")
                 st.rerun()
         else:
             st.warning("Please enter a URL.")
@@ -388,14 +452,20 @@ def render_resource_panel() -> None:
         "Upload a PDF",
         type=["pdf"],
         key="pdf_uploader",
-        help="Large PDFs are chunked automatically.",
+        help="Full PDF is semantically chunked and indexed in ChromaDB.",
     )
     if pdf_file is not None:
         already_titles = [r["source"] for r in st.session_state.custom_resources]
         if pdf_file.name not in already_titles:
             if st.button("➕ Add PDF", key="add_pdf_btn"):
-                with st.spinner(f"Extracting text from {pdf_file.name} …"):
-                    result = extract_pdf(pdf_file.read(), pdf_file.name)
+                with st.spinner(f"Extracting and indexing {pdf_file.name} …"):
+                    result = extract_pdf(
+                        pdf_file.read(),
+                        pdf_file.name,
+                        doc_store=doc_store,
+                        collection_name=session_coll,
+                        persist_to_library=save_to_library,
+                    )
                 st.session_state.custom_resources.append({
                     "type": "pdf",
                     "source": pdf_file.name,
@@ -405,19 +475,37 @@ def render_resource_panel() -> None:
                 stage = st.session_state.workflow_stage
                 if stage > 0:
                     st.session_state.resource_added_after_stage = stage
-                st.success(f"Added PDF: {pdf_file.name}")
+                lib_note = " + saved to library" if save_to_library else ""
+                st.success(f"Added PDF{lib_note}: {pdf_file.name}")
                 st.rerun()
 
-    # --- Resource list ---
+    # --- Session resource list ---
     if st.session_state.custom_resources:
-        st.markdown("**Current Resources:**")
+        st.markdown("**Session Resources:**")
         for idx, r in enumerate(st.session_state.custom_resources):
             col_label, col_btn = st.columns([4, 1])
             icon = "🔗" if r["type"] == "url" else "📄"
             col_label.markdown(f"{icon} {r['title'][:40]}")
             if col_btn.button("✕", key=f"remove_resource_{idx}"):
+                # Also remove from session ChromaDB collection
+                doc_store.remove_document(r["source"], session_coll)
                 st.session_state.custom_resources.pop(idx)
                 st.rerun()
+
+    # --- Persistent document library ---
+    with st.expander("📚 Document Library", expanded=False):
+        st.caption("Documents saved here persist across sessions.")
+        lib_docs = doc_store.list_documents("library")
+        if lib_docs:
+            for doc in lib_docs:
+                icon = "🔗" if doc["type"] == "url" else "📄"
+                col_l, col_b = st.columns([4, 1])
+                col_l.markdown(f"{icon} {doc['title'][:38]}")
+                if col_b.button("✕", key=f"remove_lib_{doc['source']}"):
+                    doc_store.remove_document(doc["source"], "library")
+                    st.rerun()
+        else:
+            st.caption("No documents in library yet. Add resources with 'Save to persistent library' checked.")
 
     # --- Re-run buttons when resource added after a completed stage ---
     stage_now = st.session_state.workflow_stage
@@ -467,6 +555,75 @@ def render_resource_panel() -> None:
                 st.session_state.workflow_stage = 1
                 st.session_state.resource_added_after_stage = None
                 st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# RAG / ChromaDB helpers
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def get_document_store(embed_model: str) -> DocumentStore:
+    """Return a cached DocumentStore for the given embedding model."""
+    return DocumentStore(embedding_model=embed_model)
+
+
+def build_rag_resources_block(
+    query: str,
+    doc_store: DocumentStore,
+    session_id: str,
+    n_results: int = 6,
+) -> str:
+    """Retrieve the most relevant resource chunks for *query* from ChromaDB.
+
+    Queries both the session collection and the persistent library, then
+    formats the results as a labelled resources block for agent prompts.
+    Returns an empty string if no documents are stored or retrieval fails.
+    """
+    collections = [f"session_{session_id}", "library"]
+    results = doc_store.query_multi(query, collection_names=collections, n_results=n_results)
+    if not results:
+        return ""
+
+    lines: list[str] = [
+        "\n\nCUSTOM RESOURCES PROVIDED BY USER "
+        "(treat as authoritative primary sources; cite them explicitly in output):"
+    ]
+    # Group chunks by source for readability
+    grouped: dict[str, list[dict]] = {}
+    for r in results:
+        src = r["source"]
+        grouped.setdefault(src, []).append(r)
+
+    for i, (src, chunks) in enumerate(grouped.items(), 1):
+        title = chunks[0]["title"]
+        rtype = chunks[0]["type"].upper()
+        lines.append(f"\n--- Resource {i}: {title} ({rtype}: {src}) ---")
+        for chunk in chunks:
+            lines.append(chunk["content"])
+        lines.append("--- End Resource ---")
+
+    return "\n".join(lines)
+
+
+def _try_embed_resource(
+    content: str,
+    source: str,
+    title: str,
+    doc_type: str,
+    collection_name: str,
+    doc_store: DocumentStore,
+) -> int:
+    """Embed a resource into ChromaDB; returns chunk count (0 on failure)."""
+    if not st.session_state.get("rag_enabled", True):
+        return 0
+    try:
+        n = doc_store.add_document(content, source, title, doc_type, collection_name)
+        return n
+    except Exception as exc:
+        # Non-fatal — fall back to prompt-injection truncation
+        import logging
+        logging.getLogger(__name__).warning("Embed resource failed: %s", exc)
+        return 0
 
 
 # Configure page
@@ -547,7 +704,7 @@ def get_llm(model_name: str = "llama2") -> OllamaLLM:
         base_url="http://localhost:11434",
         temperature=0.7,
         num_ctx=8192,       # Up from Ollama's implicit 2048 default
-        num_predict=2048,   # Allow non-writer agents to produce longer responses
+        num_predict=4096,   # Increased from 2048 — avoids truncated research outputs
     )
 
 
@@ -747,14 +904,29 @@ class WebSearchTool(BaseTool):
     description: str = "Search the web for information. Input should be a search query string. Returns top search results with titles, links, and snippets."
     
     def _run(self, query: str) -> str:
-        """Search the web using selected method"""
+        """Search the web using selected method, then rerank by relevance."""
         search_method = st.session_state.get('search_method', 'selenium')
         browser_type = st.session_state.get('browser_type', 'chrome')
-        
+
         if search_method == 'selenium':
-            return self._selenium_search(query, browser_type)
+            raw = self._selenium_search(query, browser_type)
         else:
-            return self._ddg_search(query)
+            raw = self._ddg_search(query)
+
+        # Rerank results by embedding similarity when RAG is enabled
+        if st.session_state.get('rag_enabled', True):
+            try:
+                results_list = json.loads(raw)
+                if isinstance(results_list, list) and len(results_list) > 1:
+                    doc_store = get_document_store(
+                        st.session_state.get('embed_model', 'nomic-embed-text')
+                    )
+                    reranked = doc_store.rerank_web_results(query, results_list)
+                    return json.dumps(reranked, indent=2)
+            except Exception:
+                pass  # Fall through to return raw results
+
+        return raw
     
     def _selenium_search(self, query: str, browser_type: str) -> str:
         """Search using Selenium headless browser"""
@@ -1112,7 +1284,12 @@ def _parse_target_word_count(output_length: str) -> int:
     return int(m.group(1)) if m else 1000
 
 
-def _prime_ollama_context(model: str, num_ctx: int, base_url: str = "http://localhost:11434") -> None:
+def _prime_ollama_context(
+    model: str,
+    num_ctx: int,
+    base_url: str = "http://localhost:11434",
+    max_retries: int = 3,
+) -> bool:
     """Prime Ollama to load the model with the desired num_ctx.
 
     Sends a minimal /api/generate request with num_ctx in the options block.
@@ -1123,26 +1300,38 @@ def _prime_ollama_context(model: str, num_ctx: int, base_url: str = "http://loca
     This is the only reliable way to set num_ctx when going through the
     LiteLLM/CrewAI stack, because CrewAI hardcodes litellm.drop_params=True
     which silently discards extra kwargs like num_ctx before the Ollama call.
+
+    Retries up to *max_retries* times with exponential back-off.
+    Returns True on success, False on failure (non-fatal either way).
     """
-    try:
-        resp = requests.post(
-            f"{base_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": ".",
-                "stream": False,
-                "options": {
-                    "num_ctx": num_ctx,
-                    "num_predict": 1,   # Generate only 1 token — just to trigger model load
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{base_url}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": ".",
+                    "stream": False,
+                    "options": {
+                        "num_ctx": num_ctx,
+                        "num_predict": 1,  # Minimal generation — just triggers model load
+                    },
                 },
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        # Non-fatal: log but don't crash. CrewAI will still call the model;
-        # it just may use a smaller context window than requested.
-        st.warning(f"\u26a0\ufe0f Could not prime Ollama context window ({num_ctx} tokens): {e}")
+                timeout=90,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)   # 1 s, 2 s back-off
+            else:
+                # Non-fatal: log but don't crash. CrewAI will still call the model;
+                # it may use a smaller context window than requested.
+                st.warning(
+                    f"Could not prime Ollama context window ({num_ctx:,} tokens) "
+                    f"after {max_retries} attempts: {exc}"
+                )
+    return False
 
 
 def _markdown_to_docx(markdown_text: str, title: str = "Research Output") -> bytes:
@@ -1248,6 +1437,8 @@ def step5_write_output(
     context: str = "",
     resources: str = "",
     num_ctx_writer: int = 32768,
+    doc_store: "DocumentStore | None" = None,
+    session_id: str = "",
 ) -> str:
     """Write the final output document in the chosen format and length.
 
@@ -1288,17 +1479,29 @@ def step5_write_output(
 
     # ------------------------------------------------------------------
     # PATH A: Section-by-section writing (targets >= 5,000 words)
-    # Each section is a separate Crew call with a compressed research
-    # summary, keeping each call's input well within the context window.
+    # Each section gets its own Crew call.  When a doc_store is available,
+    # research content is first embedded and then retrieved per-section so
+    # each writer call receives the most relevant chunks rather than a
+    # fixed compressed slice of all research.
     # ------------------------------------------------------------------
     if use_sectional:
         st.subheader(f"Step 6: Writing {format_label} (section by section)")
         sections = TEMPLATE_SECTIONS.get(output_format, TEMPLATE_SECTIONS["blog_post"])
         words_per_section = max(400, target_words // len(sections))
 
-        # Compress all research inputs to a fixed-size block (~7 K tokens max).
-        # This ensures each section call has a predictable, moderate input size
-        # even when the raw research content is very large.
+        # --- Embed research content for per-section retrieval ---
+        research_coll = f"rsch_{session_id}" if session_id else ""
+        rag_available = False
+        if doc_store is not None and session_id:
+            with st.spinner("Indexing research content for per-section retrieval …"):
+                n_chunks = doc_store.embed_research_content(
+                    research_plan, initial_research, web_research, session_id
+                )
+            rag_available = n_chunks > 0
+            if rag_available:
+                st.session_state.research_embedded = True
+
+        # Fallback compressed summary (used when RAG is unavailable)
         research_summary = (
             f"RESEARCH PLAN SUMMARY:\n{research_plan[:1500]}\n\n"
             f"INITIAL RESEARCH (KEY POINTS):\n{initial_research[:2000]}\n\n"
@@ -1312,8 +1515,29 @@ def step5_write_output(
             is_first = i == 0
             is_last  = i == len(sections) - 1
 
-            # Pass the last ~400 words of prior output as a continuity anchor
-            # so each section flows naturally from the previous one.
+            # --- Per-section research retrieval ---
+            if rag_available:
+                section_query = f"{section_name} {st.session_state.get('user_input', '')}"
+                collections_for_section = [
+                    research_coll,
+                    f"session_{session_id}",
+                    "library",
+                ]
+                chunks = doc_store.query_multi(
+                    section_query, collections_for_section, n_results=8
+                )
+                if chunks:
+                    lines = ["\n--- Relevant Research for This Section ---"]
+                    for c in chunks:
+                        lines.append(f"[{c['title']} | score {c['score']:.2f}]")
+                        lines.append(c["content"])
+                    section_research = "\n".join(lines)
+                else:
+                    section_research = research_summary
+            else:
+                section_research = research_summary
+
+            # Pass the last ~400 words of prior output as a continuity anchor.
             prior_context = ""
             if section_outputs:
                 prior_words = " ".join(section_outputs).split()
@@ -1329,7 +1553,8 @@ def step5_write_output(
                 You are writing ONE section of a {format_label}.
 
                 --- Research Material ---
-                {research_summary}
+                {section_research}
+                {context}
                 {prior_context}
 
                 --- Your Task ---
@@ -1519,6 +1744,54 @@ def main() -> None:
             st.markdown("**Refresh models:** Restart the app after installing new models")
             st.code("ollama pull <model-name>", language="bash")
 
+        # RAG / Embedding settings
+        st.markdown("---")
+        st.markdown("### 🧠 RAG Settings")
+
+        rag_enabled: bool = st.checkbox(
+            "Enable semantic RAG",
+            value=st.session_state.get("rag_enabled", True),
+            help=(
+                "Uses ChromaDB + embeddings for semantic chunking, per-section "
+                "retrieval, and web result reranking. Disable to fall back to "
+                "the original prompt-injection truncation approach."
+            ),
+        )
+        st.session_state.rag_enabled = rag_enabled
+
+        if rag_enabled:
+            embed_model_options = classify_embedding_models(installed_models)
+            if not embed_model_options:
+                embed_model_options = [model_name]
+
+            # Default to nomic-embed-text if available, else first option
+            default_embed = st.session_state.get("embed_model", "nomic-embed-text")
+            if default_embed not in embed_model_options:
+                default_embed = embed_model_options[0]
+
+            embed_model_choice: str = st.selectbox(
+                "Embedding model",
+                embed_model_options,
+                index=embed_model_options.index(default_embed),
+                help=(
+                    "Model used to generate embeddings. Dedicated embedding models "
+                    "(nomic-embed-text, mxbai-embed-large) are smaller/faster. "
+                    "Any Ollama model works as a fallback."
+                ),
+            )
+            if st.session_state.get("embed_model") != embed_model_choice:
+                st.session_state.embed_model = embed_model_choice
+                # Bust the cached store so it re-initialises with the new model
+                get_document_store.clear()
+
+            if "nomic-embed" not in embed_model_choice and "mxbai-embed" not in embed_model_choice:
+                st.info(
+                    "Tip: Install a dedicated embedding model for best results:\n"
+                    "`ollama pull nomic-embed-text`"
+                )
+        else:
+            st.caption("RAG disabled — using truncation-based prompt injection.")
+
         # Writer context window setting
         st.markdown("---")
         st.markdown("### 🖥️ Writer Context Window")
@@ -1608,14 +1881,37 @@ def main() -> None:
 
         st.markdown("---")
         if st.button("🔄 Reset Workflow"):
+            # Clear session-scoped ChromaDB collections before wiping session state
+            try:
+                _doc_store = get_document_store(
+                    st.session_state.get("embed_model", "nomic-embed-text")
+                )
+                _sid = st.session_state.get("session_id", "")
+                if _sid:
+                    _doc_store.clear_session(_sid)
+            except Exception:
+                pass
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
 
     # ------------------------------------------------------------------
-    # Initialise LLM (cached)
+    # Initialise LLM (cached) and document store
     # ------------------------------------------------------------------
     llm = get_llm(model_name)
+    _embed_model = st.session_state.get("embed_model", "nomic-embed-text")
+    _doc_store = get_document_store(_embed_model)
+    _session_id = st.session_state.get("session_id", "default")
+    # Store doc_store reference in session state for tool access (e.g. WebSearchTool)
+    st.session_state["_doc_store_embed_model"] = _embed_model
+
+    def _resources_for(query: str) -> str:
+        """Return RAG-retrieved resources for *query*, falling back to truncation."""
+        if st.session_state.get("rag_enabled", True) and st.session_state.get("custom_resources"):
+            rag_block = build_rag_resources_block(query, _doc_store, _session_id)
+            if rag_block:
+                return rag_block
+        return build_resources_block()
 
     # ------------------------------------------------------------------
     # Stage 0 -- Research Context + Topic Entry
@@ -1728,7 +2024,7 @@ def main() -> None:
             )
 
         context = build_context_block()
-        resources = build_resources_block()
+        resources = _resources_for(st.session_state.user_input)
 
         if st.session_state.research_plan is None:
             st.session_state.research_plan = step1_interpret_and_plan(
@@ -1739,8 +2035,13 @@ def main() -> None:
         st.text_area("Plan", st.session_state.research_plan, height=300)
 
         if st.session_state.initial_research is None:
+            # Use research plan as query for more focused resource retrieval
+            resources_for_research = _resources_for(
+                st.session_state.research_plan[:400]
+            )
             st.session_state.initial_research = step2_initial_research(
-                st.session_state.research_plan, llm, context=context, resources=resources
+                st.session_state.research_plan, llm, context=context,
+                resources=resources_for_research
             )
 
         st.subheader("Initial Research")
@@ -1774,7 +2075,9 @@ def main() -> None:
             )
 
         context = build_context_block()
-        resources = build_resources_block()
+        resources = _resources_for(
+            f"gaps in research about {st.session_state.user_input}"
+        )
 
         if st.session_state.gap_analysis is None:
             st.session_state.gap_analysis = step3_gap_analysis(
@@ -1810,7 +2113,9 @@ def main() -> None:
             )
 
         context = build_context_block()
-        resources = build_resources_block()
+        resources = _resources_for(
+            st.session_state.gap_analysis[:400] if st.session_state.gap_analysis else st.session_state.user_input
+        )
 
         if not st.session_state.get("enable_web_search", True):
             st.warning("⚠️ Web search is disabled. Skipping to output format selection.")
@@ -1933,7 +2238,7 @@ def main() -> None:
             )
 
         context = build_context_block()
-        resources = build_resources_block()
+        resources = _resources_for(st.session_state.user_input)
 
         if st.session_state.written_output is None:
             st.session_state.written_output = step5_write_output(
@@ -1946,6 +2251,8 @@ def main() -> None:
                 context=context,
                 resources=resources,
                 num_ctx_writer=st.session_state.get("num_ctx_writer", 32768),
+                doc_store=_doc_store if st.session_state.get("rag_enabled", True) else None,
+                session_id=_session_id,
             )
             # Keep legacy alias so HTML step can access it
             st.session_state.blog_post = st.session_state.written_output
