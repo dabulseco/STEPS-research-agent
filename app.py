@@ -17,6 +17,7 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import streamlit as st
 from rag import DocumentStore, classify_embedding_models
+from tools import local_kb_tool, pubmed_search_tool, citation_resolver_tool
 from crewai import Agent, Task, Crew, Process
 
 try:
@@ -1071,15 +1072,19 @@ def step2_initial_research(research_plan: str, llm, context: str = "", resources
     researcher_agent = Agent(
         role="Knowledge Researcher",
         goal=(
-            "Provide comprehensive information based on existing knowledge, "
-            "always keeping the specified audience and perspective in mind."
+            "Provide comprehensive information grounded in the user's own uploaded "
+            "materials when they are relevant, and in your general knowledge otherwise. "
+            "Always keep the specified audience and perspective in mind."
         ),
         backstory=(
             "You are a knowledgeable researcher who synthesises information on "
-            "diverse topics. You adapt the depth and framing of your research to "
-            "the intended audience and the researcher's stated perspective."
+            "diverse topics. You ground answers in the user's primary sources first "
+            "and only fall back to general knowledge when they don't address the question. "
+            "You adapt the depth and framing of your research to the intended audience "
+            "and the researcher's stated perspective."
         ),
         llm=llm_string,
+        tools=[local_kb_tool],   # M6 LocalKB
         verbose=True,
         allow_delegation=False,
     )
@@ -1090,6 +1095,13 @@ def step2_initial_research(research_plan: str, llm, context: str = "", resources
         {research_plan}
         {context}
         {resources}
+
+        For each main research question, first call the `local_kb` tool with a
+        focused 3–6 word query (e.g. the question text itself, or a distilled
+        version of it). If `local_kb` returns relevant chunks, integrate them
+        into your answer and cite them explicitly as [Source: <title>]. Only
+        fall back to your general knowledge for material the local knowledge
+        base does not cover.
 
         Provide detailed information on each topic using your existing knowledge.
         Structure your response with:
@@ -1102,7 +1114,10 @@ def step2_initial_research(research_plan: str, llm, context: str = "", resources
         repeat research that those resources already cover — instead reference them.
         """,
         agent=researcher_agent,
-        expected_output="Comprehensive research report based on existing knowledge",
+        expected_output=(
+            "Comprehensive research report grounded in the user's supplied "
+            "documents where possible, with explicit citations"
+        ),
     )
 
     crew = Crew(
@@ -1202,18 +1217,19 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
     web_researcher_agent = Agent(
         role="Web Research Specialist",
         goal=(
-            "Find and synthesise information from the web to fill research gaps, "
-            "complementing any custom resources already provided. "
-            "If web search is unavailable, synthesise available information and "
-            "note what could not be verified."
+            "Find and synthesise information from PubMed, the open web, and the "
+            "user's own uploaded documents to fill research gaps, with explicit "
+            "citations. If a backend is unavailable, synthesise available information "
+            "and note what could not be verified."
         ),
         backstory=(
-            "You are skilled at searching the web and extracting relevant information "
-            "for a specific audience and perspective. When searches fail, you document "
-            "what information is missing and work with available data."
+            "You are skilled at searching PubMed and the open web and at pulling "
+            "relevant passages from the user's own materials. You always cite "
+            "PMIDs for biomedical claims, prefer recent primary sources, and "
+            "document any gaps you could not fill."
         ),
         llm=llm_string,
-        tools=[search_tool],
+        tools=[search_tool, pubmed_search_tool, local_kb_tool],   # H1 + M6 added
         verbose=True,
         allow_delegation=False,
         max_iter=10,
@@ -1226,29 +1242,42 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
         {context}
         {resources}
 
-        Use the web_search tool to find information for the most important identified gaps.
-        For each gap:
-        1. Try searching with clear, specific queries
-        2. If a search fails or returns no results, note this and move to the next gap
-        3. Summarise findings from successful searches
-        4. Note sources when available
+        For each gap, work through the following decision tree:
+
+        1. First call `local_kb` with a 3–6 word query. If it returns relevant
+           chunks from the user's own uploaded materials, prefer those and cite
+           them as [Source: <title>].
+        2. If the gap is biomedical (genes, diseases, drugs, antibodies,
+           clinical findings) and `local_kb` did not cover it, call
+           `pubmed_search` with mode='search' and max_results=10. Skim the
+           returned titles and abstracts; if one paper is clearly the key
+           reference, call `pubmed_search` again with mode='fetch' and that
+           PMID for the full structured record. Cite PMIDs as [PMID: 12345678]
+           inline.
+        3. For non-biomedical angles or very recent preprints, fall back to
+           `web_search`.
+
+        Always cite the source you actually used — do not invent PMIDs or URLs.
 
         IMPORTANT:
         - If custom resources are listed above, treat them as already-gathered data —
           do NOT re-search topics they cover; simply reference them.
         - Focus on 2-3 most critical gaps to avoid rate limiting
-        - If web search consistently fails, compile findings from searches that did work
-        - Document which gaps could not be filled due to search limitations
-        - Provide a summary even if some searches fail
+        - If all backends consistently fail, compile findings from any backend
+          that did work and document what could not be filled
         - Frame all findings for the specified audience and perspective
 
         Compile findings into a report that includes:
-        - Information found from successful searches
+        - Information found from successful searches (with explicit PMID/URL/title
+          citations for each non-trivial claim)
         - Sources/links when available
         - List of gaps that could not be filled and why
         """,
         agent=web_researcher_agent,
-        expected_output="Web research findings with sources, including documentation of any search failures",
+        expected_output=(
+            "Web research findings with explicit PMID/URL/title sources, "
+            "including documentation of any search failures"
+        ),
     )
     
     crew = Crew(
@@ -1473,6 +1502,7 @@ def step5_write_output(
         goal=template["agent_goal"],
         backstory=template["agent_backstory"],
         llm=llm_string,        # Bare string — uses the working LiteLLM/Ollama path
+        tools=[citation_resolver_tool, local_kb_tool],   # M3 + M6
         verbose=True,
         allow_delegation=False,
     )
@@ -1567,6 +1597,14 @@ def step5_write_output(
                 Write ONLY this section. Do NOT write any other sections.
                 Start with a clear ## heading for "{section_name}".
                 Use markdown formatting throughout.
+                For every primary source you cite — every [PMID: 12345678],
+                every [DOI: ...], every [arXiv: ...] — call
+                `resolve_citation` with that identifier and use the returned
+                structured record to build the bibliography. Do not invent
+                bibliographic fields; if `resolve_citation` returns an error
+                for an identifier, fall back to [Source: <title>] inline and
+                note the unresolved citation at the end.
+
                 Cite sources as [Source: URL or Title] where relevant.
 
                 Format guidance: {template["structure_guidance"]}
@@ -1635,6 +1673,14 @@ def step5_write_output(
         detail, examples, evidence, and analysis until the target is met.
 
         --- Citation Instructions ---
+        For every primary source you cite — every [PMID: 12345678], every
+        [DOI: ...], every [arXiv: ...] — call `resolve_citation` with that
+        identifier and use the returned structured record to build the
+        bibliography. Do not invent bibliographic fields; if
+        `resolve_citation` returns an error for an identifier, fall back to
+        [Source: <title>] inline and note the unresolved citation at the
+        end.
+
         Cite sources using [Source: URL or Title] inline format.
         Prioritise and explicitly cite any custom resources listed above.
 
