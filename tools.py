@@ -2509,7 +2509,7 @@ class ClinicalTrialsTool(BaseTool):
     args_schema: type[BaseModel] = ClinicalTrialsInput
 
     def _run(self, query: str, max_results: int = 10) -> str:
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty query"})
         try:
             n = int(max_results)
@@ -2600,7 +2600,7 @@ def _reactome_pathways(query: str) -> list[dict[str, Any]]:
             results.append({
                 "source": "reactome",
                 "id": entry.get("stId", ""),
-                "name": entry.get("name", ""),
+                "name": re.sub(r"<[^>]+>", "", entry.get("name", "") or ""),
                 "species": ", ".join(entry.get("species", []) or []),
                 "url": f"https://reactome.org/content/detail/{entry.get('stId', '')}",
             })
@@ -2619,7 +2619,7 @@ class PathwayDatabaseTool(BaseTool):
     args_schema: type[BaseModel] = PathwayLookupInput
 
     def _run(self, query: str, source: Literal["kegg", "reactome", "both"] = "both") -> str:
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty query"})
         q = query.strip()
         results: list[dict[str, Any]] = []
@@ -2696,10 +2696,10 @@ def _eutils_dataset_search(query: str, n: int, db: str) -> list[dict[str, Any]]:
             continue
         records.append({
             "source": "geo" if db == "gds" else "ncbi_bioproject",
-            "accession": rec.get("accession", rec.get("Accession", rid)),
-            "title": rec.get("title", rec.get("Project_Title", "")),
-            "organism": rec.get("taxon", rec.get("Organism_Name", "")),
-            "summary": (rec.get("summary", rec.get("Project_Description", "")) or "")[:500],
+            "accession": rec.get("accession", rec.get("project_acc", rid)),
+            "title": rec.get("title", rec.get("project_title", "")),
+            "organism": rec.get("taxon", rec.get("organism_name", "")),
+            "summary": (rec.get("summary", rec.get("project_description", "")) or "")[:500],
             "url": (
                 f"https://www.ncbi.nlm.nih.gov/gds/?term={rid}" if db == "gds"
                 else f"https://www.ncbi.nlm.nih.gov/bioproject/{rid}"
@@ -2709,11 +2709,21 @@ def _eutils_dataset_search(query: str, n: int, db: str) -> list[dict[str, Any]]:
 
 
 def _ena_dataset_search(query: str, n: int) -> list[dict[str, Any]]:
+    # ENA's query language is Lucene-like: a literal `"` would break out of the
+    # quoted wildcard, breaking the request (HTTP 400).
+    #
+    # A bare `-` inside the quoted wildcard silently zeroes out results (e.g.
+    # "SARS-CoV-2") because ENA tokenizes on `-` and a wildcard match can't
+    # bridge that token boundary. Backslash-escaping `-` (the usual Lucene
+    # escape) does NOT fix this -- confirmed live, `\-` still returns zero
+    # results. What does work live is replacing `-` with `*`, turning the
+    # hyphen itself into a wildcard gap between tokens.
+    sanitized_query = query.replace('"', "").replace("-", "*")
     resp = requests.get(
         ENA_PORTAL_BASE,
         params={
             "result": "study",
-            "query": f'study_title="*{query}*"',
+            "query": f'study_title="*{sanitized_query}*"',
             "fields": "study_accession,study_title,tax_id",
             "format": "json",
             "limit": str(n),
@@ -2748,7 +2758,7 @@ class DatasetSearchTool(BaseTool):
     args_schema: type[BaseModel] = DatasetSearchInput
 
     def _run(self, query: str, source: Literal["geo", "ena", "ncbi"] = "geo", max_results: int = 10) -> str:
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty query"})
         try:
             n = int(max_results)
@@ -2888,12 +2898,15 @@ def _wipo_search(query: str, n: int) -> list[dict[str, Any]]:
             "WIPO PATENTSCOPE search requires WIPO_PATENTSCOPE_KEY "
             "(register at patentscope.wipo.int)"
         )
-    resp = requests.get(
-        f"{WIPO_PATENTSCOPE_BASE}/search",
-        params={"q": query, "key": key, "size": n},
-        timeout=PATENT_TIMEOUT,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.get(
+            f"{WIPO_PATENTSCOPE_BASE}/search",
+            params={"q": query, "key": key, "size": n},
+            timeout=PATENT_TIMEOUT,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(str(exc).replace(key, "***")) from None
     data = resp.json()
     records = []
     for r in (data.get("results") or [])[:n]:
@@ -2919,7 +2932,7 @@ class PatentSearchTool(BaseTool):
     args_schema: type[BaseModel] = PatentSearchInput
 
     def _run(self, query: str, source: Literal["uspto", "epo", "wipo"] = "uspto", max_results: int = 10) -> str:
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty query"})
         try:
             n = int(max_results)
@@ -3022,7 +3035,7 @@ class DrugInteractionTool(BaseTool):
     args_schema: type[BaseModel] = DrugLookupInput
 
     def _run(self, query: str, source: Literal["drugbank", "chembl"] = "chembl") -> str:
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty query"})
         try:
             if source == "chembl":
@@ -3073,7 +3086,7 @@ class GitHubCodeSearchTool(BaseTool):
     args_schema: type[BaseModel] = GitHubSearchInput
 
     def _run(self, query: str, max_results: int = 10) -> str:
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty query"})
         try:
             n = int(max_results)
@@ -3178,7 +3191,7 @@ class AudioTranscriptTool(BaseTool):
     args_schema: type[BaseModel] = AudioTranscriptInput
 
     def _run(self, source: str, language: Optional[str] = None) -> str:
-        if not source or not source.strip():
+        if not isinstance(source, str) or not source.strip():
             return json.dumps({"error": "empty source"})
         try:
             from faster_whisper import WhisperModel  # noqa: F401

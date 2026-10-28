@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,9 +26,13 @@ def test_clinical_trials_empty_query():
 
 
 def test_clinical_trials_max_results_clamping():
-    out = clinical_trials_tool._run("lung cancer", max_results=9999)
-    parsed = json.loads(out)
-    assert isinstance(parsed, (list, dict))
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"studies": []}
+    mock_resp.raise_for_status.return_value = None
+    with patch("tools.requests.get", return_value=mock_resp) as mock_get:
+        clinical_trials_tool._run("lung cancer", max_results=9999)
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["pageSize"] == "50"
 
 
 def test_clinical_trials_live_or_skip():
@@ -71,9 +76,15 @@ def test_dataset_search_empty_query():
 
 
 def test_dataset_search_max_results_clamping():
-    out = dataset_search_tool._run("cancer", source="geo", max_results=9999)
-    parsed = json.loads(out)
-    assert isinstance(parsed, (list, dict))
+    # _eutils_dataset_search returns early after esearch when idlist is empty,
+    # so only one requests.get call happens -- no need to mock esummary too.
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"esearchresult": {"idlist": []}}
+    mock_resp.raise_for_status.return_value = None
+    with patch("tools.requests.get", return_value=mock_resp) as mock_get:
+        dataset_search_tool._run("cancer", source="geo", max_results=9999)
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["retmax"] == "50"
 
 
 def test_dataset_search_geo_live_or_skip():
@@ -152,9 +163,13 @@ def test_github_search_empty_query():
 
 
 def test_github_search_max_results_clamping():
-    out = github_code_search_tool._run("transformer", max_results=9999)
-    parsed = json.loads(out)
-    assert isinstance(parsed, (list, dict))
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"items": []}
+    mock_resp.raise_for_status.return_value = None
+    with patch("tools.requests.get", return_value=mock_resp) as mock_get:
+        github_code_search_tool._run("transformer", max_results=9999)
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["per_page"] == "50"
 
 
 def test_github_search_live_or_skip():

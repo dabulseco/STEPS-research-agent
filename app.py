@@ -1327,9 +1327,11 @@ def step2b_bio_curation(
            with source='both' (KEGG + Reactome).
         8. If the topic involves an omics dataset, call `dataset_search`
            with source='geo' (or 'ena'/'ncbi') to find published datasets.
-        9. For therapeutic candidates that may be patented, call
-           `patent_search` with source='uspto' first (the only backend that
-           works without a paid key in this deployment).
+        9. For therapeutic candidates that may be patented, you may call
+           `patent_search` (source='uspto', 'epo', or 'wipo'), but note that
+           all three backends currently require an API key that is not
+           configured in this deployment, so expect a missing-key error and
+           note it gracefully rather than treating it as a failure.
         10. For small-molecule or biologic mechanism/phase data, call
             `drug_lookup` with source='chembl' (no key required).
 
