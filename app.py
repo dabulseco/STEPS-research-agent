@@ -2,6 +2,9 @@ import os
 import uuid
 import warnings
 
+from dotenv import load_dotenv
+load_dotenv()  # Loads OLLAMA_API_KEY (and anything else) from a local .env file — never committed, see .env.example
+
 # CRITICAL: Set environment variables BEFORE importing crewai
 os.environ['CREWAI_TELEMETRY_ENABLED'] = 'false'
 os.environ['OTEL_SDK_DISABLED'] = 'true'
@@ -11,6 +14,11 @@ os.environ['OPENAI_MODEL_NAME'] = 'gpt-4'  # Dummy model name
 # Disable interactive prompts
 os.environ['CREWAI_DISABLE_TELEMETRY_PROMPT'] = 'true'
 os.environ['CREWAI_STORAGE_DIR'] = './.crewai_storage'
+
+# Ollama Cloud — optional. Set OLLAMA_API_KEY in .env to unlock cloud models
+# in the sidebar's model picker (billed per-token on your Ollama account).
+OLLAMA_API_KEY: str = os.environ.get('OLLAMA_API_KEY', '')
+OLLAMA_CLOUD_BASE_URL: str = os.environ.get('OLLAMA_CLOUD_BASE_URL', 'https://ollama.com')
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -38,7 +46,7 @@ from tools import (
     github_code_search_tool,
     audio_transcript_tool,
 )
-from crewai import Agent, Task, Crew, Process
+from crewai import Agent, Task, Crew, Process, LLM
 
 try:
     from langchain_ollama import OllamaLLM
@@ -701,6 +709,42 @@ def get_installed_ollama_models():
         st.warning(f"Error fetching models: {str(e)}")
         return []
 
+# Function to get Ollama Cloud models available to the configured API key
+def get_cloud_ollama_models() -> list:
+    """Fetch the list of cloud models available via the Ollama Cloud API.
+
+    Requires OLLAMA_API_KEY (set in .env — see .env.example). Returns an
+    empty list when no key is configured, so the cloud option simply
+    doesn't appear in the model picker. Falls back to a short static list
+    of known cloud model IDs if the live call fails — Ollama's cloud
+    catalog changes over time, so treat the fallback as best-effort.
+    """
+    if not OLLAMA_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            f"{OLLAMA_CLOUD_BASE_URL}/api/tags",
+            headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        models = [m["name"] for m in resp.json().get("models", []) if m.get("name")]
+        if models:
+            return models
+    except Exception as e:
+        st.warning(f"Could not fetch Ollama Cloud models ({e}); using a fallback list.")
+
+    # Fallback — known cloud models as of this writing. The live catalog at
+    # https://ollama.com/search?c=cloud is the source of truth if this drifts.
+    return [
+        "gpt-oss:120b-cloud",
+        "gpt-oss:20b-cloud",
+        "deepseek-v3.1:671b-cloud",
+        "qwen3-coder:480b-cloud",
+        "kimi-k2:1t-cloud",
+        "glm-4.6:cloud",
+    ]
+
 # Verify model exists in Ollama
 def verify_model_exists(model_name):
     """Check if a model exists in Ollama"""
@@ -736,6 +780,24 @@ def get_llm(model_name: str = "llama2") -> OllamaLLM:
         num_ctx=8192,       # Up from Ollama's implicit 2048 default
         num_predict=4096,   # Increased from 2048 — avoids truncated research outputs
     )
+
+
+def build_agent_llm(model_name: str):
+    """Return the CrewAI-compatible `llm` value for *model_name*.
+
+    Local models keep using the existing bare "ollama/<model>" string
+    (unchanged behavior — LiteLLM resolves it against localhost:11434).
+    Cloud models need an explicit base_url + api_key, since LiteLLM's
+    Ollama provider only talks to localhost by default; CrewAI's `LLM`
+    class accepts both and is a drop-in replacement for the bare string.
+    """
+    if st.session_state.get("is_cloud_model"):
+        return LLM(
+            model=f"ollama/{model_name}",
+            base_url=OLLAMA_CLOUD_BASE_URL,
+            api_key=OLLAMA_API_KEY,
+        )
+    return f"ollama/{model_name}"
 
 
 # Selenium-based web search
@@ -1032,7 +1094,7 @@ def step1_interpret_and_plan(user_request: str, llm, context: str = "", resource
     """Interpret user request and create research plan."""
     st.subheader("Step 1: Interpreting Request & Creating Research Plan")
 
-    llm_string = f"ollama/{llm.model}"
+    llm_string = build_agent_llm(llm.model)
 
     interpreter_agent = Agent(
         role="Research Request Interpreter",
@@ -1096,7 +1158,7 @@ def step2_initial_research(research_plan: str, llm, context: str = "", resources
     """Execute initial research using local LLM knowledge."""
     st.subheader("Step 2: Executing Initial Research (Local LLM)")
 
-    llm_string = f"ollama/{llm.model}"
+    llm_string = build_agent_llm(llm.model)
 
     researcher_agent = Agent(
         role="Knowledge Researcher",
@@ -1175,7 +1237,7 @@ def step3_gap_analysis(
     """Analyze gaps in the initial research."""
     st.subheader("Step 3: Conducting Gap Analysis")
 
-    llm_string = f"ollama/{llm.model}"
+    llm_string = build_agent_llm(llm.model)
 
     analyst_agent = Agent(
         role="Research Gap Analyst",
@@ -1255,7 +1317,7 @@ def step2b_bio_curation(
 ):
     """Run the Bio Curator agent over the gap analysis."""
     st.subheader("Step 2b: Bio Curation")
-    llm_string = f"ollama/{llm.model}"
+    llm_string = build_agent_llm(llm.model)
 
     bio_curator_agent = Agent(
         role="Bio Curator",
@@ -1446,7 +1508,7 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
     """Conduct web searches to fill identified gaps."""
     st.subheader("Step 4: Conducting Web Research")
 
-    llm_string = f"ollama/{llm.model}"
+    llm_string = build_agent_llm(llm.model)
 
     web_researcher_agent = Agent(
         role="Web Research Specialist",
@@ -1843,10 +1905,15 @@ def step5_write_output(
     # num_ctx set by this priming request.
     # (CrewAI hardcodes litellm.drop_params=True, so passing num_ctx via
     # kwargs is silently dropped — direct priming is the only reliable path.)
-    with st.spinner(f"Preparing writer (context window: {num_ctx_writer:,} tokens) …"):
-        _prime_ollama_context(llm.model, num_ctx=num_ctx_writer)
+    if st.session_state.get("is_cloud_model"):
+        # No local VRAM load to prime for a cloud model — the direct REST
+        # priming trick only matters for Ollama's local model-loading behavior.
+        st.caption("☁️ Cloud model — skipping local context-window priming.")
+    else:
+        with st.spinner(f"Preparing writer (context window: {num_ctx_writer:,} tokens) …"):
+            _prime_ollama_context(llm.model, num_ctx=num_ctx_writer)
 
-    llm_string = f"ollama/{llm.model}"
+    llm_string = build_agent_llm(llm.model)
 
     writer_agent = Agent(
         role=template["agent_role"],
@@ -2096,47 +2163,74 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Configuration")
 
-        # Model selection
+        # Model selection — local Ollama models, plus Ollama Cloud models
+        # when OLLAMA_API_KEY is set (see .env.example).
         installed_models = get_installed_ollama_models()
-        if not installed_models:
+        cloud_models = get_cloud_ollama_models()
+
+        if not installed_models and not cloud_models:
             st.error("⚠️ No Ollama models found!")
             st.markdown("Please install a model first:")
             st.code("ollama pull llama2", language="bash")
             st.stop()
 
-        model_name: str = st.selectbox(
-            "🤖 Select Ollama Model",
-            installed_models,
-            help="Select from your locally installed Ollama models",
-        )
+        cloud_suffix = " (cloud)"
+        model_options = installed_models + [f"{m}{cloud_suffix}" for m in cloud_models]
 
-        if not verify_model_exists(model_name):
+        model_choice: str = st.selectbox(
+            "🤖 Select Ollama Model",
+            model_options,
+            help=(
+                "Local models run on this machine. \"(cloud)\" models run on "
+                "Ollama's servers (billed per token) and require OLLAMA_API_KEY."
+            ),
+        )
+        if not cloud_models:
+            st.caption(
+                "Tip: set `OLLAMA_API_KEY` in a `.env` file (see `.env.example`) "
+                "to add Ollama Cloud models here."
+            )
+
+        is_cloud_model = model_choice.endswith(cloud_suffix)
+        model_name: str = model_choice[: -len(cloud_suffix)] if is_cloud_model else model_choice
+        st.session_state.is_cloud_model = is_cloud_model
+
+        if not is_cloud_model and not verify_model_exists(model_name):
             st.error(f"⚠️ Model '{model_name}' not found in Ollama!")
             st.code(f"ollama pull {model_name}", language="bash")
             st.stop()
 
         with st.expander("ℹ️ Model Information"):
             st.markdown(f"**Selected Model:** `{model_name}`")
-            st.markdown("**Status:** ✅ Available")
-            try:
-                proc = subprocess.run(
-                    ["ollama", "list"], capture_output=True, text=True, timeout=5
-                )
-                if proc.returncode == 0:
-                    for line in proc.stdout.split("\n"):
-                        if model_name in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                st.markdown(f"**Size:** {parts[2]}")
-                            break
-            except Exception:
-                pass
-            st.markdown("---")
-            st.markdown("**Your Installed Models:**")
-            for m in installed_models:
-                prefix = "- ✅ **" if m == model_name else "- "
-                suffix = "** (selected)" if m == model_name else ""
-                st.markdown(f"{prefix}{m}{suffix}")
+            if is_cloud_model:
+                st.markdown("**Status:** ☁️ Ollama Cloud (billed per token)")
+                st.markdown("---")
+                st.markdown("**Available Cloud Models:**")
+                for m in cloud_models:
+                    prefix = "- ✅ **" if m == model_name else "- "
+                    suffix = "** (selected)" if m == model_name else ""
+                    st.markdown(f"{prefix}{m}{suffix}")
+            else:
+                st.markdown("**Status:** ✅ Available (local)")
+                try:
+                    proc = subprocess.run(
+                        ["ollama", "list"], capture_output=True, text=True, timeout=5
+                    )
+                    if proc.returncode == 0:
+                        for line in proc.stdout.split("\n"):
+                            if model_name in line:
+                                parts = line.split()
+                                if len(parts) >= 3:
+                                    st.markdown(f"**Size:** {parts[2]}")
+                                break
+                except Exception:
+                    pass
+                st.markdown("---")
+                st.markdown("**Your Installed Models:**")
+                for m in installed_models:
+                    prefix = "- ✅ **" if m == model_name else "- "
+                    suffix = "** (selected)" if m == model_name else ""
+                    st.markdown(f"{prefix}{m}{suffix}")
             st.markdown("---")
             st.markdown("**Refresh models:** Restart the app after installing new models")
             st.code("ollama pull <model-name>", language="bash")
