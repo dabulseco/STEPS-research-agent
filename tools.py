@@ -2536,3 +2536,110 @@ class ClinicalTrialsTool(BaseTool):
 
 
 clinical_trials_tool = ClinicalTrialsTool()
+
+
+# ===========================================================================
+# L2 — PathwayDatabaseTool
+# ===========================================================================
+# KEGG REST (rest.kegg.jp) + Reactome ContentService — both no-key, public.
+# KEGG has commercial-use restrictions; this tool is read-only lookup, which
+# is within KEGG's free-use terms for individual/academic use.
+
+KEGG_BASE: str = "https://rest.kegg.jp"
+REACTOME_BASE: str = "https://reactome.org/ContentService"
+PATHWAY_TIMEOUT: int = 20
+
+
+class PathwayLookupInput(BaseModel):
+    """Inputs for PathwayDatabaseTool."""
+
+    query: str = Field(
+        ..., description="Gene symbol, protein name, compound, or pathway keyword."
+    )
+    source: Literal["kegg", "reactome", "both"] = Field(
+        "both", description="Pathway database to query: 'kegg', 'reactome', or 'both'."
+    )
+
+
+def _kegg_pathways(query: str) -> list[dict[str, Any]]:
+    resp = requests.get(
+        f"{KEGG_BASE}/find/pathway/{requests.utils.quote(query)}",
+        timeout=PATHWAY_TIMEOUT,
+    )
+    resp.raise_for_status()
+    results = []
+    for line in resp.text.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        pid, name = parts
+        clean_id = pid.replace("path:", "")
+        results.append({
+            "source": "kegg",
+            "id": clean_id,
+            "name": name,
+            "url": f"https://www.kegg.jp/pathway/{clean_id}",
+        })
+    return results
+
+
+def _reactome_pathways(query: str) -> list[dict[str, Any]]:
+    resp = requests.get(
+        f"{REACTOME_BASE}/search/query",
+        params={"query": query, "species": "Homo sapiens", "types": "Pathway", "cluster": "true"},
+        timeout=PATHWAY_TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results = []
+    for group in data.get("results", []) or []:
+        for entry in group.get("entries", []) or []:
+            results.append({
+                "source": "reactome",
+                "id": entry.get("stId", ""),
+                "name": entry.get("name", ""),
+                "species": ", ".join(entry.get("species", []) or []),
+                "url": f"https://reactome.org/content/detail/{entry.get('stId', '')}",
+            })
+    return results
+
+
+class PathwayDatabaseTool(BaseTool):
+    """Look up biological pathways involving a gene, protein, or compound."""
+
+    name: str = "pathway_lookup"
+    description: str = (
+        "Look up biological pathways involving a gene, protein, or compound. "
+        "Returns pathway name, ID, and source database. Source options: "
+        "'kegg', 'reactome', or 'both'. No API key required."
+    )
+    args_schema: type[BaseModel] = PathwayLookupInput
+
+    def _run(self, query: str, source: Literal["kegg", "reactome", "both"] = "both") -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        q = query.strip()
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        if source in ("kegg", "both"):
+            try:
+                results.extend(_kegg_pathways(q))
+            except Exception as exc:
+                errors.append(f"KEGG: {exc}")
+        if source in ("reactome", "both"):
+            try:
+                results.extend(_reactome_pathways(q))
+            except Exception as exc:
+                errors.append(f"Reactome: {exc}")
+        if not results and errors:
+            return json.dumps({"error": "; ".join(errors)})
+        payload: dict[str, Any] = {"results": results[:50]}
+        if errors:
+            payload["partial_errors"] = errors
+        return json.dumps(payload, indent=2)
+
+
+pathway_lookup_tool = PathwayDatabaseTool()

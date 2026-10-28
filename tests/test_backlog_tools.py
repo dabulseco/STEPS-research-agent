@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools import clinical_trials_tool  # noqa: E402
+from tools import clinical_trials_tool, pathway_lookup_tool  # noqa: E402
 
 
 def test_clinical_trials_empty_query():
@@ -34,3 +34,27 @@ def test_clinical_trials_live_or_skip():
     assert isinstance(parsed, (list, dict))
     if isinstance(parsed, list) and parsed:
         assert "nct_id" in parsed[0]
+
+
+def test_pathway_lookup_empty_query():
+    out = pathway_lookup_tool._run("")
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_pathway_lookup_kegg_live_or_skip():
+    if os.environ.get("SKIP_LIVE_TOOL_TESTS") == "1":
+        return
+    out = pathway_lookup_tool._run("p53", source="kegg")
+    parsed = json.loads(out)
+    assert isinstance(parsed, dict)
+    assert "results" in parsed or "error" in parsed
+
+
+def test_pathway_lookup_reactome_live_or_skip():
+    if os.environ.get("SKIP_LIVE_TOOL_TESTS") == "1":
+        return
+    out = pathway_lookup_tool._run("apoptosis", source="reactome")
+    parsed = json.loads(out)
+    assert isinstance(parsed, dict)
+    assert "results" in parsed or "error" in parsed
