@@ -30,6 +30,13 @@ from tools import (
     ncbi_genomics_tool,
     antibody_therapeutic_tool,
     figure_caption_tool,
+    clinical_trials_tool,
+    pathway_lookup_tool,
+    dataset_search_tool,
+    patent_search_tool,
+    drug_interaction_tool,
+    github_code_search_tool,
+    audio_transcript_tool,
 )
 from crewai import Agent, Task, Crew, Process
 
@@ -1256,16 +1263,19 @@ def step2b_bio_curation(
             "Resolve the biomedical entities in the research plan and gap "
             "analysis into structured primary data: gene records, protein "
             "FASTA snippets, structure files, BLAST hits, variant "
-            "significance, and antibody therapeutic metadata. Cite every "
-            "claim with the source record (NCBI gene ID, PDB ID, UniProt, "
-            "Thera-SAbDab, etc.)."
+            "significance, antibody therapeutic metadata, relevant clinical "
+            "trials, pathways, published datasets, patents, and drug "
+            "records. Cite every claim with the source record (NCBI gene "
+            "ID, PDB ID, UniProt, Thera-SAbDab, NCT ID, etc.)."
         ),
         backstory=(
             "You are a domain curator who pulls authoritative records from "
-            "NCBI, RCSB PDB, AlphaFold DB, and antibody databases. You "
-            "prefer RefSeq / UniProt primary IDs over free-text names. When "
-            "a tool returns an error, you note it and continue rather than "
-            "halting the run."
+            "NCBI, RCSB PDB, AlphaFold DB, antibody databases, "
+            "ClinicalTrials.gov, KEGG/Reactome, GEO/ENA, patent offices, "
+            "and ChEMBL. You prefer RefSeq / UniProt primary IDs over "
+            "free-text names. When a tool returns an error — including a "
+            "missing API key for a licensed source like DrugBank or EPO — "
+            "you note it and continue rather than halting the run."
         ),
         llm=llm_string,
         tools=[
@@ -1274,6 +1284,11 @@ def step2b_bio_curation(
             structure_lookup_tool,       # M2
             antibody_therapeutic_tool,   # H5
             local_kb_tool,               # M6 (for cross-references in user uploads)
+            clinical_trials_tool,        # L1
+            pathway_lookup_tool,         # L2
+            dataset_search_tool,         # L3
+            patent_search_tool,          # L4
+            drug_interaction_tool,       # L5
         ],
         verbose=True,
         allow_delegation=False,
@@ -1306,10 +1321,22 @@ def step2b_bio_curation(
         4. For PDB IDs, call `structure_lookup` with source='pdb' to
            download the mmCIF and pull resolution / method.
         5. For ClinVar variants, call `ncbi_genomics` with entity='variant'.
+        6. If a drug, disease, or gene has an active therapeutic program,
+           call `clinical_trials` to find relevant trials and their phase/status.
+        7. For pathway context on a gene or compound, call `pathway_lookup`
+           with source='both' (KEGG + Reactome).
+        8. If the topic involves an omics dataset, call `dataset_search`
+           with source='geo' (or 'ena'/'ncbi') to find published datasets.
+        9. For therapeutic candidates that may be patented, call
+           `patent_search` with source='uspto' first (the only backend that
+           works without a paid key in this deployment).
+        10. For small-molecule or biologic mechanism/phase data, call
+            `drug_lookup` with source='chembl' (no key required).
 
         End with a one-paragraph synthesis: which entities are central to
         the user's question, what is well-established vs. uncertain, and
-        which sources were unreachable.
+        which sources were unreachable (including any skipped because a
+        required API key was not configured).
         """,
         agent=bio_curator_agent,
         expected_output=(
@@ -1438,7 +1465,10 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
             "the topic is biomedical, you can also pull structured records "
             "from NCBI (genes, proteins, variants), BLAST sequences against "
             "public databases, fetch PDB/AlphaFold structures, and look up "
-            "antibody therapeutic metadata."
+            "antibody therapeutic metadata. When the topic has a software or "
+            "implementation angle, you can search GitHub for reference code. "
+            "When a resource is a podcast, lecture, or recorded talk, you can "
+            "transcribe it locally rather than skipping it."
         ),
         llm=llm_string,
         tools=[
@@ -1453,6 +1483,8 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
             sequence_alignment_tool,    # sequence_align    (M1) — bio
             structure_lookup_tool,      # structure_lookup  (M2) — bio
             antibody_therapeutic_tool,  # antibody_therapeutic (H5) — bio
+            github_code_search_tool,    # github_search     (L6)
+            audio_transcript_tool,      # transcribe_audio  (L7)
         ],
         verbose=True,
         allow_delegation=False,
