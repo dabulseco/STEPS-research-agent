@@ -3039,3 +3039,76 @@ class DrugInteractionTool(BaseTool):
 
 
 drug_interaction_tool = DrugInteractionTool()
+
+# ===========================================================================
+# L6 — GitHubCodeSearchTool
+# ===========================================================================
+# GitHub REST search API. Works unauthenticated at a lower rate limit;
+# GITHUB_TOKEN (optional) raises the limit the same way NCBI_API_KEY does
+# for PubMedSearchTool.
+
+GITHUB_SEARCH_BASE: str = "https://api.github.com/search/repositories"
+GITHUB_TIMEOUT: int = 20
+
+
+class GitHubSearchInput(BaseModel):
+    """Inputs for GitHubCodeSearchTool."""
+
+    query: str = Field(..., description="Search terms: library name, algorithm, or topic.")
+    max_results: int = Field(
+        10, ge=1, le=50, description="Maximum number of repositories to return (1-50)."
+    )
+
+
+class GitHubCodeSearchTool(BaseTool):
+    """Search GitHub for reference implementations and libraries."""
+
+    name: str = "github_search"
+    description: str = (
+        "Search GitHub for reference implementations, libraries, and code related to "
+        "the research topic. Returns repository name, description, language, stars, "
+        "and URL. Works without a token at a lower rate limit; set GITHUB_TOKEN for "
+        "a higher rate limit."
+    )
+    args_schema: type[BaseModel] = GitHubSearchInput
+
+    def _run(self, query: str, max_results: int = 10) -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(50, n))
+
+        headers = {"Accept": "application/vnd.github+json"}
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            resp = requests.get(
+                GITHUB_SEARCH_BASE,
+                params={"q": query.strip(), "per_page": str(n), "sort": "stars", "order": "desc"},
+                headers=headers,
+                timeout=GITHUB_TIMEOUT,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", []) or []
+            records = [{
+                "name": repo.get("full_name", ""),
+                "description": repo.get("description", "") or "",
+                "language": repo.get("language", "") or "",
+                "stars": repo.get("stargazers_count", 0),
+                "url": repo.get("html_url", ""),
+            } for repo in items]
+            return json.dumps(records, indent=2)
+        except requests.RequestException as exc:
+            logger.warning("GitHubSearch network error: %s", exc)
+            return json.dumps({"error": f"GitHubSearch network error: {exc}"})
+        except Exception as exc:
+            logger.warning("GitHubSearch tool failed: %s", exc)
+            return json.dumps({"error": f"GitHubSearch tool failed: {exc}"})
+
+
+github_code_search_tool = GitHubCodeSearchTool()
