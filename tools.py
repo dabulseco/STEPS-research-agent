@@ -2643,3 +2643,133 @@ class PathwayDatabaseTool(BaseTool):
 
 
 pathway_lookup_tool = PathwayDatabaseTool()
+
+
+# ===========================================================================
+# L3 — DatasetSearchTool
+# ===========================================================================
+# 'geo' and 'ncbi' both reuse the existing NCBI E-utilities helpers
+# (`_EUtilsState`, `_eutils_params`, `EUTILS_BASE`) defined earlier in this
+# module for PubMedSearchTool — 'geo' queries db=gds, 'ncbi' queries
+# db=bioproject. 'ena' hits the EBI ENA Portal API directly (no key).
+
+ENA_PORTAL_BASE: str = "https://www.ebi.ac.uk/ena/portal/api/search"
+DATASET_HTTP_TIMEOUT: int = 20
+
+
+class DatasetSearchInput(BaseModel):
+    """Inputs for DatasetSearchTool."""
+
+    query: str = Field(..., description="Free-text query: organism, assay type, gene, or disease.")
+    source: Literal["geo", "ena", "ncbi"] = Field(
+        "geo",
+        description="'geo' for NCBI GEO datasets, 'ena' for ENA read studies, 'ncbi' for NCBI BioProject.",
+    )
+    max_results: int = Field(
+        10, ge=1, le=50, description="Maximum number of records to return (1-50)."
+    )
+
+
+def _eutils_dataset_search(query: str, n: int, db: str) -> list[dict[str, Any]]:
+    _EUtilsState.throttle()
+    resp = requests.get(
+        f"{EUTILS_BASE}/esearch.fcgi",
+        params=_eutils_params({"db": db, "term": query, "retmax": str(n), "retmode": "json"}),
+        timeout=DATASET_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    ids = resp.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+    _EUtilsState.throttle()
+    resp = requests.get(
+        f"{EUTILS_BASE}/esummary.fcgi",
+        params=_eutils_params({"db": db, "id": ",".join(ids), "retmode": "json"}),
+        timeout=DATASET_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    result = resp.json().get("result", {})
+    records = []
+    for rid in ids:
+        rec = result.get(rid, {})
+        if not isinstance(rec, dict):
+            continue
+        records.append({
+            "source": "geo" if db == "gds" else "ncbi_bioproject",
+            "accession": rec.get("accession", rec.get("Accession", rid)),
+            "title": rec.get("title", rec.get("Project_Title", "")),
+            "organism": rec.get("taxon", rec.get("Organism_Name", "")),
+            "summary": (rec.get("summary", rec.get("Project_Description", "")) or "")[:500],
+            "url": (
+                f"https://www.ncbi.nlm.nih.gov/gds/?term={rid}" if db == "gds"
+                else f"https://www.ncbi.nlm.nih.gov/bioproject/{rid}"
+            ),
+        })
+    return records
+
+
+def _ena_dataset_search(query: str, n: int) -> list[dict[str, Any]]:
+    resp = requests.get(
+        ENA_PORTAL_BASE,
+        params={
+            "result": "study",
+            "query": f'study_title="*{query}*"',
+            "fields": "study_accession,study_title,tax_id",
+            "format": "json",
+            "limit": str(n),
+        },
+        timeout=DATASET_HTTP_TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
+    resp.raise_for_status()
+    data = resp.json() if resp.text.strip() else []
+    records = []
+    for rec in data:
+        records.append({
+            "source": "ena",
+            "accession": rec.get("study_accession", ""),
+            "title": rec.get("study_title", ""),
+            "organism": rec.get("tax_id", ""),
+            "url": f"https://www.ebi.ac.uk/ena/browser/view/{rec.get('study_accession', '')}",
+        })
+    return records
+
+
+class DatasetSearchTool(BaseTool):
+    """Find published omics datasets (GEO, ENA, NCBI BioProject)."""
+
+    name: str = "dataset_search"
+    description: str = (
+        "Find published omics datasets. 'geo' searches NCBI GEO (expression/sequencing "
+        "datasets), 'ena' searches the EBI European Nucleotide Archive (read studies), "
+        "'ncbi' searches NCBI BioProject. Returns accession, title, organism, and a link. "
+        "No API key required."
+    )
+    args_schema: type[BaseModel] = DatasetSearchInput
+
+    def _run(self, query: str, source: Literal["geo", "ena", "ncbi"] = "geo", max_results: int = 10) -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(50, n))
+
+        try:
+            if source == "geo":
+                records = _eutils_dataset_search(query.strip(), n, db="gds")
+            elif source == "ncbi":
+                records = _eutils_dataset_search(query.strip(), n, db="bioproject")
+            else:
+                records = _ena_dataset_search(query.strip(), n)
+            return json.dumps(records, indent=2)
+        except requests.RequestException as exc:
+            logger.warning("DatasetSearch network error: %s", exc)
+            return json.dumps({"error": f"DatasetSearch network error: {exc}"})
+        except Exception as exc:
+            logger.warning("DatasetSearch tool failed: %s", exc)
+            return json.dumps({"error": f"DatasetSearch tool failed: {exc}"})
+
+
+dataset_search_tool = DatasetSearchTool()

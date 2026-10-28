@@ -11,7 +11,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools import clinical_trials_tool, pathway_lookup_tool  # noqa: E402
+from tools import (  # noqa: E402
+    clinical_trials_tool, pathway_lookup_tool, dataset_search_tool,
+)
 
 
 def test_clinical_trials_empty_query():
@@ -58,3 +60,31 @@ def test_pathway_lookup_reactome_live_or_skip():
     parsed = json.loads(out)
     assert isinstance(parsed, dict)
     assert "results" in parsed or "error" in parsed
+
+
+def test_dataset_search_empty_query():
+    out = dataset_search_tool._run("")
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_dataset_search_max_results_clamping():
+    out = dataset_search_tool._run("cancer", source="geo", max_results=9999)
+    parsed = json.loads(out)
+    assert isinstance(parsed, (list, dict))
+
+
+def test_dataset_search_geo_live_or_skip():
+    if os.environ.get("SKIP_LIVE_TOOL_TESTS") == "1":
+        return
+    out = dataset_search_tool._run("breast cancer RNA-seq", source="geo", max_results=3)
+    parsed = json.loads(out)
+    assert isinstance(parsed, (list, dict))
+
+
+def test_dataset_search_ena_live_or_skip():
+    if os.environ.get("SKIP_LIVE_TOOL_TESTS") == "1":
+        return
+    out = dataset_search_tool._run("SARS-CoV-2", source="ena", max_results=3)
+    parsed = json.loads(out)
+    assert isinstance(parsed, (list, dict))
