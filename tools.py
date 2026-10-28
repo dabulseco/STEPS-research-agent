@@ -2944,3 +2944,98 @@ class PatentSearchTool(BaseTool):
 
 
 patent_search_tool = PatentSearchTool()
+
+# ===========================================================================
+# L5 — DrugInteractionTool
+# ===========================================================================
+# 'chembl' is open, no-key (EBI ChEMBL REST API). 'drugbank' requires a
+# commercial license key, gated the same way L4's backends are.
+
+CHEMBL_BASE: str = "https://www.ebi.ac.uk/chembl/api/data"
+DRUG_TIMEOUT: int = 20
+
+
+class DrugLookupInput(BaseModel):
+    """Inputs for DrugInteractionTool."""
+
+    query: str = Field(..., description="Drug or biologic name, target, or indication.")
+    source: Literal["drugbank", "chembl"] = Field("chembl", description="Drug database to query.")
+
+
+def _chembl_lookup(query: str) -> list[dict[str, Any]]:
+    resp = requests.get(
+        f"{CHEMBL_BASE}/molecule/search.json",
+        params={"q": query},
+        timeout=DRUG_TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    records = []
+    for m in (data.get("molecules") or [])[:10]:
+        records.append({
+            "source": "chembl",
+            "chembl_id": m.get("molecule_chembl_id", ""),
+            "name": m.get("pref_name", ""),
+            "molecule_type": m.get("molecule_type", ""),
+            "max_phase": m.get("max_phase", ""),
+            "url": f"https://www.ebi.ac.uk/chembl/explore/compound/{m.get('molecule_chembl_id', '')}",
+        })
+    return records
+
+
+def _drugbank_lookup(query: str) -> list[dict[str, Any]]:
+    api_key = os.environ.get("DRUGBANK_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "DrugBank search requires DRUGBANK_API_KEY (commercial license; "
+            "see go.drugbank.com)"
+        )
+    resp = requests.get(
+        "https://api.drugbank.com/v1/drug_names",
+        params={"q": query},
+        headers={"Authorization": api_key},
+        timeout=DRUG_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    records = []
+    for d in (data or [])[:10]:
+        records.append({
+            "source": "drugbank",
+            "drugbank_id": d.get("drugbank_id", ""),
+            "name": d.get("name", ""),
+        })
+    return records
+
+
+class DrugInteractionTool(BaseTool):
+    """Look up drug or biologic records by name, target, or indication."""
+
+    name: str = "drug_lookup"
+    description: str = (
+        "Look up drug or biologic records (small molecules and antibodies) by name, "
+        "target, or indication. 'chembl' is open and requires no key; 'drugbank' "
+        "requires DRUGBANK_API_KEY (commercial license). Returns molecule type, "
+        "development phase, and identifiers."
+    )
+    args_schema: type[BaseModel] = DrugLookupInput
+
+    def _run(self, query: str, source: Literal["drugbank", "chembl"] = "chembl") -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            if source == "chembl":
+                records = _chembl_lookup(query.strip())
+            else:
+                records = _drugbank_lookup(query.strip())
+            return json.dumps(records, indent=2)
+        except requests.RequestException as exc:
+            logger.warning("DrugLookup network error: %s", exc)
+            return json.dumps({"error": f"DrugLookup network error: {exc}"})
+        except Exception as exc:
+            logger.warning("DrugLookup tool failed: %s", exc)
+            return json.dumps({"error": str(exc)})
+
+
+drug_interaction_tool = DrugInteractionTool()

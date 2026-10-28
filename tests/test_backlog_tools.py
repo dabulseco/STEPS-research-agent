@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import (  # noqa: E402
     clinical_trials_tool, pathway_lookup_tool, dataset_search_tool,
-    patent_search_tool,
+    patent_search_tool, drug_interaction_tool,
 )
 
 
@@ -120,3 +120,25 @@ def test_patent_search_wipo_missing_key():
     parsed = json.loads(out)
     assert "error" in parsed
     assert "WIPO_PATENTSCOPE_KEY" in parsed["error"]
+
+
+def test_drug_lookup_empty_query():
+    out = drug_interaction_tool._run("")
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_drug_lookup_drugbank_missing_key():
+    os.environ.pop("DRUGBANK_API_KEY", None)
+    out = drug_interaction_tool._run("imatinib", source="drugbank")
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "DRUGBANK_API_KEY" in parsed["error"]
+
+
+def test_drug_lookup_chembl_live_or_skip():
+    if os.environ.get("SKIP_LIVE_TOOL_TESTS") == "1":
+        return
+    out = drug_interaction_tool._run("imatinib", source="chembl")
+    parsed = json.loads(out)
+    assert isinstance(parsed, (list, dict))
