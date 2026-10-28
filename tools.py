@@ -2773,3 +2773,174 @@ class DatasetSearchTool(BaseTool):
 
 
 dataset_search_tool = DatasetSearchTool()
+
+
+# ===========================================================================
+# L4 — PatentSearchTool
+# ===========================================================================
+# Three backends, all requiring a credential this harness does not ship
+# with — each gated the same way GoogleScholarTool gates SERPAPI_API_KEY:
+# missing key -> a clear {"error": "... requires <ENV_VAR> ..."}, not a crash.
+
+PATENTSVIEW_BASE: str = "https://search.patentsview.org/api/v1/patent/"
+EPO_OPS_AUTH_URL: str = "https://ops.epo.org/3.2/auth/accesstoken"
+EPO_OPS_SEARCH_BASE: str = "https://ops.epo.org/3.2/rest-services/published-data/search"
+WIPO_PATENTSCOPE_BASE: str = "https://patentscope.wipo.int/search/rest"
+PATENT_TIMEOUT: int = 20
+
+
+class PatentSearchInput(BaseModel):
+    """Inputs for PatentSearchTool."""
+
+    query: str = Field(..., description="Free-text query: invention keywords, assignee, or inventor.")
+    source: Literal["uspto", "epo", "wipo"] = Field("uspto", description="Patent office to search.")
+    max_results: int = Field(
+        10, ge=1, le=50, description="Maximum number of patents to return (1-50)."
+    )
+
+
+def _uspto_patentsview_search(query: str, n: int) -> list[dict[str, Any]]:
+    api_key = os.environ.get("PATENTSVIEW_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "USPTO search requires PATENTSVIEW_API_KEY (free key from "
+            "https://patentsview.org/apis/keyrequest)"
+        )
+    q = json.dumps({"_text_any": {"patent_title": query}})
+    f = json.dumps([
+        "patent_id", "patent_title", "patent_date",
+        "assignees.assignee_organization",
+    ])
+    o = json.dumps({"size": n})
+    resp = requests.get(
+        PATENTSVIEW_BASE,
+        params={"q": q, "f": f, "o": o},
+        headers={"X-Api-Key": api_key},
+        timeout=PATENT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    records = []
+    for p in data.get("patents", []) or []:
+        assignees = p.get("assignees") or []
+        records.append({
+            "source": "uspto",
+            "patent_id": p.get("patent_id", ""),
+            "title": p.get("patent_title", ""),
+            "date": p.get("patent_date", ""),
+            "assignee": assignees[0].get("assignee_organization", "") if assignees else "",
+            "url": f"https://patents.google.com/patent/US{p.get('patent_id', '')}",
+        })
+    return records
+
+
+def _epo_search(query: str, n: int) -> list[dict[str, Any]]:
+    key = os.environ.get("EPO_OPS_KEY")
+    secret = os.environ.get("EPO_OPS_SECRET")
+    if not key or not secret:
+        raise RuntimeError(
+            "EPO search requires EPO_OPS_KEY and EPO_OPS_SECRET "
+            "(register at developers.epo.org)"
+        )
+    token_resp = requests.post(
+        EPO_OPS_AUTH_URL,
+        data={"grant_type": "client_credentials"},
+        auth=(key, secret),
+        timeout=PATENT_TIMEOUT,
+    )
+    token_resp.raise_for_status()
+    token = token_resp.json().get("access_token", "")
+    resp = requests.get(
+        EPO_OPS_SEARCH_BASE,
+        params={"q": query},
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=PATENT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    docs = (
+        data.get("ops:world-patent-data", {})
+        .get("ops:biblio-search", {})
+        .get("ops:search-result", {})
+        .get("ops:publication-reference", [])
+    )
+    if isinstance(docs, dict):
+        docs = [docs]
+    records = []
+    for d in docs[:n]:
+        doc_id = d.get("document-id") or [{}]
+        if isinstance(doc_id, list):
+            doc_id = doc_id[0] if doc_id else {}
+        country = (doc_id.get("country") or {}).get("$", "")
+        number = (doc_id.get("doc-number") or {}).get("$", "")
+        records.append({
+            "source": "epo",
+            "patent_id": f"{country}{number}",
+            "url": f"https://worldwide.espacenet.com/patent/search?q={country}{number}",
+        })
+    return records
+
+
+def _wipo_search(query: str, n: int) -> list[dict[str, Any]]:
+    key = os.environ.get("WIPO_PATENTSCOPE_KEY")
+    if not key:
+        raise RuntimeError(
+            "WIPO PATENTSCOPE search requires WIPO_PATENTSCOPE_KEY "
+            "(register at patentscope.wipo.int)"
+        )
+    resp = requests.get(
+        f"{WIPO_PATENTSCOPE_BASE}/search",
+        params={"q": query, "key": key, "size": n},
+        timeout=PATENT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    records = []
+    for r in (data.get("results") or [])[:n]:
+        records.append({
+            "source": "wipo",
+            "patent_id": r.get("documentId", ""),
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+        })
+    return records
+
+
+class PatentSearchTool(BaseTool):
+    """Search patent literature for antibodies, sequences, or therapeutics."""
+
+    name: str = "patent_search"
+    description: str = (
+        "Search patent literature for antibodies, sequences, or therapeutic candidates. "
+        "'uspto' uses the PatentsView API (requires PATENTSVIEW_API_KEY), 'epo' uses "
+        "EPO OPS (requires EPO_OPS_KEY/EPO_OPS_SECRET), 'wipo' uses PATENTSCOPE "
+        "(requires WIPO_PATENTSCOPE_KEY). Returns patent ID, title, date, and assignee."
+    )
+    args_schema: type[BaseModel] = PatentSearchInput
+
+    def _run(self, query: str, source: Literal["uspto", "epo", "wipo"] = "uspto", max_results: int = 10) -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(50, n))
+
+        try:
+            if source == "uspto":
+                records = _uspto_patentsview_search(query.strip(), n)
+            elif source == "epo":
+                records = _epo_search(query.strip(), n)
+            else:
+                records = _wipo_search(query.strip(), n)
+            return json.dumps(records, indent=2)
+        except requests.RequestException as exc:
+            logger.warning("PatentSearch network error: %s", exc)
+            return json.dumps({"error": f"PatentSearch network error: {exc}"})
+        except Exception as exc:
+            logger.warning("PatentSearch tool failed: %s", exc)
+            return json.dumps({"error": str(exc)})
+
+
+patent_search_tool = PatentSearchTool()

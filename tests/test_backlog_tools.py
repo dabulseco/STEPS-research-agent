@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import (  # noqa: E402
     clinical_trials_tool, pathway_lookup_tool, dataset_search_tool,
+    patent_search_tool,
 )
 
 
@@ -88,3 +89,34 @@ def test_dataset_search_ena_live_or_skip():
     out = dataset_search_tool._run("SARS-CoV-2", source="ena", max_results=3)
     parsed = json.loads(out)
     assert isinstance(parsed, (list, dict))
+
+
+def test_patent_search_empty_query():
+    out = patent_search_tool._run("")
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_patent_search_uspto_missing_key():
+    os.environ.pop("PATENTSVIEW_API_KEY", None)
+    out = patent_search_tool._run("anti-PD1 antibody", source="uspto")
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "PATENTSVIEW_API_KEY" in parsed["error"]
+
+
+def test_patent_search_epo_missing_key():
+    os.environ.pop("EPO_OPS_KEY", None)
+    os.environ.pop("EPO_OPS_SECRET", None)
+    out = patent_search_tool._run("anti-PD1 antibody", source="epo")
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "EPO_OPS_KEY" in parsed["error"]
+
+
+def test_patent_search_wipo_missing_key():
+    os.environ.pop("WIPO_PATENTSCOPE_KEY", None)
+    out = patent_search_tool._run("anti-PD1 antibody", source="wipo")
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "WIPO_PATENTSCOPE_KEY" in parsed["error"]
