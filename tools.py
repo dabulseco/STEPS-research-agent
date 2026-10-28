@@ -2455,3 +2455,84 @@ class FigureCaptionTool(BaseTool):
 
 
 figure_caption_tool = FigureCaptionTool()
+
+# ===========================================================================
+# L1 — ClinicalTrialsTool
+# ===========================================================================
+# ClinicalTrials.gov API v2 (no API key required).
+
+CLINICAL_TRIALS_BASE: str = "https://clinicaltrials.gov/api/v2/studies"
+CLINICAL_TRIALS_TIMEOUT: int = 20
+
+
+class ClinicalTrialsInput(BaseModel):
+    """Inputs for ClinicalTrialsTool."""
+
+    query: str = Field(
+        ..., description="Condition, intervention, drug name, or NCT ID to search for."
+    )
+    max_results: int = Field(
+        10, ge=1, le=50, description="Maximum number of trials to return (1-50)."
+    )
+
+
+def _format_trial(study: dict[str, Any]) -> dict[str, Any]:
+    section = study.get("protocolSection", {}) or {}
+    ident = section.get("identificationModule", {}) or {}
+    status = section.get("statusModule", {}) or {}
+    design = section.get("designModule", {}) or {}
+    sponsor = (section.get("sponsorCollaboratorsModule", {}) or {}).get("leadSponsor", {}) or {}
+    outcomes = section.get("outcomesModule", {}) or {}
+    primary = outcomes.get("primaryOutcomes", []) or []
+    enrollment = design.get("enrollmentInfo", {}) or {}
+    return {
+        "nct_id": ident.get("nctId", ""),
+        "title": ident.get("briefTitle", ""),
+        "status": status.get("overallStatus", ""),
+        "phase": design.get("phases", []),
+        "enrollment": enrollment.get("count", ""),
+        "sponsor": sponsor.get("name", ""),
+        "primary_outcomes": [o.get("measure", "") for o in primary][:5],
+        "url": f"https://clinicaltrials.gov/study/{ident.get('nctId', '')}",
+    }
+
+
+class ClinicalTrialsTool(BaseTool):
+    """Search ClinicalTrials.gov for active and completed trials."""
+
+    name: str = "clinical_trials"
+    description: str = (
+        "Search ClinicalTrials.gov for active and completed trials by condition, "
+        "intervention, drug name, or NCT ID. Returns phase, status, enrollment, "
+        "primary outcomes, and sponsor. No API key required."
+    )
+    args_schema: type[BaseModel] = ClinicalTrialsInput
+
+    def _run(self, query: str, max_results: int = 10) -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(50, n))
+
+        try:
+            resp = requests.get(
+                CLINICAL_TRIALS_BASE,
+                params={"query.term": query.strip(), "pageSize": str(n)},
+                timeout=CLINICAL_TRIALS_TIMEOUT,
+                headers={"Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            studies = resp.json().get("studies", []) or []
+            return json.dumps([_format_trial(s) for s in studies], indent=2)
+        except requests.RequestException as exc:
+            logger.warning("ClinicalTrials network error: %s", exc)
+            return json.dumps({"error": f"ClinicalTrials network error: {exc}"})
+        except Exception as exc:
+            logger.warning("ClinicalTrials tool failed: %s", exc)
+            return json.dumps({"error": f"ClinicalTrials tool failed: {exc}"})
+
+
+clinical_trials_tool = ClinicalTrialsTool()
