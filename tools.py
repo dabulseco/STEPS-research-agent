@@ -18,8 +18,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import requests
 import streamlit as st
@@ -800,3 +801,1657 @@ class CitationResolverTool(BaseTool):
 
 # Module-level instance ready for `tools=[citation_resolver_tool]`.
 citation_resolver_tool = CitationResolverTool()
+
+
+# ===========================================================================
+# M5 — OpenAlexTool
+# ===========================================================================
+# OpenAlex (api.openalex.org) provides free, no-API-key access to 250M+
+# scholarly works across all disciplines. It's a powerful complement to
+# PubMed/Google Scholar for cross-disciplinary research.
+#
+# Endpoints we use:
+#   - /works        → search works with filters (title, author, concept, year, etc.)
+#   - /works/{id}   → fetch a single work by OpenAlex ID or DOI
+#   - /authors      → author search
+#   - /concepts     → concept/topic search
+#
+# Rate limit: 100k requests/day (generous), polite pool via `mailto=` param.
+
+OPENALEX_BASE: str = "https://api.openalex.org"
+OPENALEX_TIMEOUT: int = 20
+OPENALEX_MAILTO: str = os.environ.get("OPENALEX_MAILTO", "[email protected]")
+
+
+class OpenAlexInput(BaseModel):
+    """Inputs for OpenAlexTool."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "Free-text search query (e.g. 'transformer interpretability', "
+            "'CRISPR gene editing', 'quantum error correction')."
+        ),
+    )
+    filter: Optional[str] = Field(
+            default=None,
+            description=(
+                "OpenAlex filter string (e.g. 'from_publication_date:2023-01-01,'"
+                "cited_by_count:>10,type:journal-article'). See OpenAlex docs."
+            ),
+        )
+    max_results: int = Field(
+        10, ge=1, le=50, description="Maximum number of works to return (1–50)."
+    )
+    sample: int = Field(
+        default=0,
+        ge=0,
+        le=10000,
+        description="Random sample of results (OpenAlex 'sample' parameter).",
+    )
+
+
+def _openalex_params(extra: dict[str, str]) -> dict[str, str]:
+    """Build standard params for OpenAlex calls."""
+    return {
+        "mailto": OPENALEX_MAILTO,
+        **extra,
+    }
+
+
+def _format_openalex_work(work: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an OpenAlex work dict to our unified citation shape."""
+    # Authors
+    authors = []
+    for auth in work.get("authorships", []):
+        author = auth.get("author", {})
+        name = author.get("display_name", "")
+        if name:
+            # OpenAlex gives "First Last" — convert to "Last, F."
+            parts = name.strip().split()
+            if len(parts) >= 2:
+                last = parts[-1]
+                initials = "".join(p[0].upper() + "." for p in parts[:-1] if p)
+                authors.append(f"{last}, {initials}")
+            else:
+                authors.append(name)
+
+    # Venue
+    venue = ""
+    host = work.get("host_venue", {})
+    if host:
+        venue = host.get("display_name", "")
+    elif work.get("primary_location", {}).get("source", {}).get("display_name"):
+        venue = work["primary_location"]["source"]["display_name"]
+
+    # Year
+    year = str(work.get("publication_year", ""))
+
+    # DOI
+    doi = work.get("doi", "").replace("https://doi.org/", "")
+
+    # OpenAlex ID
+    oa_id = work.get("id", "").replace("https://openalex.org/", "")
+
+    return {
+        "type": work.get("type", "unknown"),
+        "id": oa_id,
+        "id_type": "openalex",
+        "title": work.get("display_name", ""),
+        "authors": authors,
+        "venue": venue,
+        "year": year,
+        "volume": work.get("biblio", {}).get("volume", ""),
+        "issue": work.get("biblio", {}).get("issue", ""),
+        "pages": work.get("biblio", {}).get("first_page", "")
+        + ("-" + work.get("biblio", {}).get("last_page", "") if work.get("biblio", {}).get("last_page") else ""),
+        "url": work.get("id", ""),
+        "doi": doi,
+        "cited_by_count": work.get("cited_by_count", 0),
+        "is_oa": work.get("open_access", {}).get("is_oa", False),
+        "oa_url": work.get("open_access", {}).get("oa_url", ""),
+        "concepts": [c.get("display_name", "") for c in work.get("concepts", [])[:5]],
+        "extra": {
+            "openalex_id": oa_id,
+            "mag": work.get("ids", {}).get("mag", ""),
+            "pmid": work.get("ids", {}).get("pmid", ""),
+            "pmcid": work.get("ids", {}).get("pmcid", ""),
+        },
+    }
+
+
+class OpenAlexTool(BaseTool):
+    """Search OpenAlex for open scholarly metadata across all disciplines."""
+
+    name: str = "openalex"
+    description: str = (
+        "Search OpenAlex (api.openalex.org) for scholarly works across all disciplines. "
+        "Returns title, authors, venue, year, DOI, OpenAlex ID, citation count, "
+        "open-access status/URL, and top concepts. No API key required; "
+        "rate limit ~100k/day. Use for cross-disciplinary literature discovery, "
+        "finding open-access PDFs, and citation metrics."
+    )
+    args_schema: type[BaseModel] = OpenAlexInput
+
+    def _run(
+        self,
+        query: str,
+        filter: Optional[str] = None,
+        max_results: int = 10,
+        sample: int = 0,
+    ) -> str:
+        """Search OpenAlex and return structured work records."""
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(50, n))
+
+        try:
+            sample_n = int(sample)
+        except (TypeError, ValueError):
+            sample_n = 0
+        sample_n = max(0, min(10000, sample_n))
+
+        params = _openalex_params({
+            "search": query,
+            "per_page": str(n),
+        })
+        if filter:
+            params["filter"] = filter
+        if sample_n:
+            params["sample"] = str(sample_n)
+
+        try:
+            resp = requests.get(
+                f"{OPENALEX_BASE}/works",
+                params=params,
+                timeout=OPENALEX_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+
+            formatted = [_format_openalex_work(w) for w in results]
+            return json.dumps(formatted, indent=2)
+        except requests.RequestException as exc:
+            logger.warning("OpenAlex network error: %s", exc)
+            return json.dumps({"error": f"OpenAlex network error: {exc}"})
+        except Exception as exc:
+            logger.warning("OpenAlex tool failed: %s", exc)
+            return json.dumps({"error": f"OpenAlex tool failed: {exc}"})
+
+
+openalex_tool = OpenAlexTool()
+
+
+# ===========================================================================
+# M4 — UrlFetchTool
+# ===========================================================================
+# Promote the existing `scrape_url` helper from app.py to a proper agent-callable tool.
+# This lets any agent fetch the full text of a known URL (not just search snippets).
+
+class UrlFetchInput(BaseModel):
+    """Inputs for UrlFetchTool."""
+
+    url: str = Field(..., description="URL to fetch and extract full text from.")
+
+
+class UrlFetchTool(BaseTool):
+    """Fetch the full text of a web page given a URL."""
+
+    name: str = "fetch_url"
+    description: str = (
+        "Fetch the full text of a web page given a URL. Strips navigation, scripts, "
+        "and boilerplate. Returns the cleaned text plus the page title. Use when a "
+        "known URL needs to be read in full rather than only summarized from search snippets."
+    )
+    args_schema: type[BaseModel] = UrlFetchInput
+
+    def _run(self, url: str) -> str:
+        """Fetch and extract text from a URL."""
+        if not url or not url.strip():
+            return json.dumps({"error": "empty url"})
+
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchAgent/1.0)"}
+            resp = requests.get(url.strip(), headers=headers, timeout=20)
+            resp.raise_for_status()
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+
+            title = ""
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()
+            elif soup.find("h1"):
+                title = soup.find("h1").get_text(strip=True)
+
+            full_text = soup.get_text(separator="\n", strip=True)
+
+            # Limit to ~15k chars for context window
+            if len(full_text) > 15000:
+                full_text = full_text[:15000] + "\n[... content truncated ...]"
+
+            result = {
+                "url": url,
+                "title": title or url,
+                "content": full_text,
+                "word_count": len(full_text.split()),
+            }
+            return json.dumps(result, indent=2)
+
+        except requests.RequestException as exc:
+            logger.warning("UrlFetch network error: %s", exc)
+            return json.dumps({"error": f"UrlFetch network error: {exc}"})
+        except Exception as exc:
+            logger.warning("UrlFetch failed for %s: %s", url, exc)
+            return json.dumps({"error": f"UrlFetch failed: {exc}"})
+
+
+url_fetch_tool = UrlFetchTool()
+
+
+# ===========================================================================
+# L8 — ReferenceManagerTool
+# ===========================================================================
+# Export a list of citations as BibTeX (.bib) or RIS (.ris) for use in
+# reference managers (Zotero, Mendeley, EndNote, LaTeX). Reuses CitationResolverTool
+# output format.
+
+class ReferenceManagerInput(BaseModel):
+    """Inputs for ReferenceManagerTool."""
+
+    identifiers: list[str] = Field(
+        ...,
+        description=(
+            "List of DOIs, PMIDs, arXiv IDs, ISBNs, or OpenAlex IDs to export. "
+            "Each will be resolved via CitationResolverTool / OpenAlexTool."
+        ),
+    )
+    format: Literal["bibtex", "ris"] = Field(
+        "bibtex",
+        description="Output format: 'bibtex' for LaTeX/BibTeX, 'ris' for RIS (Zotero, Mendeley, EndNote).",
+    )
+    resolve: bool = Field(
+        True,
+        description="If true, resolve each identifier to full citation first. If false, assume identifiers are already full citation dicts (JSON strings).",
+    )
+
+
+def _citation_to_bibtex(citation: dict[str, Any]) -> str:
+    """Convert a unified citation dict to a BibTeX entry."""
+    cite_type = citation.get("type", "article")
+    cite_id = citation.get("id", "").replace("https://openalex.org/", "").replace("https://doi.org/", "")
+    # Sanitize for BibTeX key
+    bib_key = re.sub(r"[^a-zA-Z0-9_-]", "_", cite_id)[:50]
+
+    # Map type to BibTeX entry type
+    type_map = {
+        "journal-article": "article",
+        "journal": "article",
+        "book": "book",
+        "book-chapter": "incollection",
+        "proceedings-article": "inproceedings",
+        "preprint": "article",
+        "dissertation": "phdthesis",
+        "report": "techreport",
+        "dataset": "misc",
+    }
+    bib_type = type_map.get(cite_type, "misc")
+
+    lines = [f"@{bib_type}{{{bib_key},"]
+
+    fields = [
+        ("title", citation.get("title", "")),
+        ("author", " and ".join(citation.get("authors", []))),
+        ("journal", citation.get("venue", "")),
+        ("year", citation.get("year", "")),
+        ("volume", citation.get("volume", "")),
+        ("number", citation.get("issue", "")),
+        ("pages", citation.get("pages", "")),
+        ("doi", citation.get("doi", "")),
+        ("url", citation.get("url", "")),
+    ]
+
+    for field, value in fields:
+        if value:
+            lines.append(f"  {field} = {{{value}}},")
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _citation_to_ris(citation: dict[str, Any]) -> str:
+    """Convert a unified citation dict to a RIS entry."""
+    cite_type = citation.get("type", "article")
+    # RIS type mapping
+    ris_type_map = {
+        "journal-article": "JOUR",
+        "journal": "JOUR",
+        "book": "BOOK",
+        "book-chapter": "CHAP",
+        "proceedings-article": "CONF",
+        "preprint": "JOUR",
+        "dissertation": "THES",
+        "report": "RPRT",
+        "dataset": "DATA",
+    }
+    ris_type = ris_type_map.get(cite_type, "GEN")
+
+    lines = [f"TY  - {ris_type}"]
+
+    if citation.get("title"):
+        lines.append(f"TI  - {citation['title']}")
+    for author in citation.get("authors", []):
+        lines.append(f"AU  - {author}")
+    if citation.get("venue"):
+        lines.append(f"JO  - {citation['venue']}")
+    if citation.get("year"):
+        lines.append(f"PY  - {citation['year']}")
+    if citation.get("volume"):
+        lines.append(f"VL  - {citation['volume']}")
+    if citation.get("issue"):
+        lines.append(f"IS  - {citation['issue']}")
+    if citation.get("pages"):
+        lines.append(f"SP  - {citation['pages'].split('-')[0]}")
+        if "-" in citation.get("pages", ""):
+            lines.append(f"EP  - {citation['pages'].split('-')[1]}")
+    if citation.get("doi"):
+        lines.append(f"DO  - {citation['doi']}")
+    if citation.get("url"):
+        lines.append(f"UR  - {citation['url']}")
+    if citation.get("abstract"):
+        lines.append(f"AB  - {citation['abstract'][:500]}")
+
+    lines.append("ER  -")
+    return "\n".join(lines)
+
+
+class ReferenceManagerTool(BaseTool):
+    """Export citations as BibTeX (.bib) or RIS (.ris)."""
+
+    name: str = "export_references"
+    description: str = (
+        "Export a list of citations as a BibTeX (.bib) or RIS (.ris) file for use in "
+        "reference managers (Zotero, Mendeley, EndNote, LaTeX). Provide a list of "
+        "DOIs, PMIDs, arXiv IDs, ISBNs, or OpenAlex IDs. The tool resolves each to a "
+        "full citation and formats the output. Use this when the bibliography section "
+        "needs to be generated for the final document."
+    )
+    args_schema: type[BaseModel] = ReferenceManagerInput
+
+    def _run(
+        self,
+        identifiers: list[str],
+        format: Literal["bibtex", "ris"] = "bibtex",
+        resolve: bool = True,
+    ) -> str:
+        """Resolve identifiers and export as BibTeX or RIS."""
+        if not identifiers:
+            return json.dumps({"error": "empty identifiers list"})
+
+        # Import resolvers
+        from tools import citation_resolver_tool, openalex_tool
+
+        entries = []
+        for ident in identifiers:
+            ident = ident.strip()
+            if not ident:
+                continue
+
+            if resolve:
+                # Try to detect and resolve
+                citation_json = ""
+                kind = _auto_detect_id_type(ident)
+                if kind == "openalex" or ident.startswith("https://openalex.org/") or ident.startswith("W"):
+                    # Use OpenAlex tool
+                    citation_json = openalex_tool._run(ident, max_results=1)
+                else:
+                    citation_json = citation_resolver_tool._run(ident, id_type="auto")
+
+                try:
+                    citation = json.loads(citation_json)
+                    if "error" not in citation:
+                        entries.append(citation)
+                    else:
+                        logger.warning("Failed to resolve %s: %s", ident, citation.get("error"))
+                        # Include as minimal entry
+                        entries.append({"id": ident, "title": ident, "error": citation.get("error")})
+                except json.JSONDecodeError:
+                    logger.warning("Could not parse citation for %s", ident)
+                    entries.append({"id": ident, "title": ident})
+            else:
+                # Assume ident is already a JSON citation dict
+                try:
+                    citation = json.loads(ident)
+                    entries.append(citation)
+                except json.JSONDecodeError:
+                    entries.append({"id": ident, "title": ident})
+
+        if not entries:
+            return json.dumps({"error": "no valid citations to export"})
+
+        if format == "bibtex":
+            output = "\n\n".join(_citation_to_bibtex(e) for e in entries)
+        else:
+            output = "\n\n".join(_citation_to_ris(e) for e in entries)
+
+        return output
+
+
+reference_manager_tool = ReferenceManagerTool()
+
+
+# ===========================================================================
+# H2 — GoogleScholarTool
+# ===========================================================================
+# Searches Google Scholar for academic papers — for non-biomedical topics,
+# preprints, theses, conference proceedings, and any cross-disciplinary
+# literature that PubMed does not cover.
+#
+# Two backends are supported, chosen at call time via the
+# `GOOGLE_SCHOLAR_BACKEND` env var (or the `backend` arg of `_run`):
+#
+#   - "selenium" (default): free, no key, but Scholar will rate-limit and
+#       captcha-block after a small number of requests.  Reuses the same
+#       headless Chrome / Firefox infrastructure the existing
+#       `WebSearchTool` uses, so it gets the same platform workarounds
+#       (macOS ARM, etc.) for free.
+#
+#   - "serpapi" (optional): paid but reliable.  Reads `SERPAPI_API_KEY`
+#       from env.  Falls back to a JSON error if the key is missing, so
+#       users without an account are never silently mis-routed to the
+#       Selenium path.
+#
+# Output shape matches the other tools' conventions — a JSON list of
+# result dicts (title, link, snippet, year, venue, cited_by, authors,
+# source), or an `{"error": "..."}` dict on failure.
+
+SCHOLAR_HTTP_TIMEOUT: int = 20
+
+
+class GoogleScholarInput(BaseModel):
+    """Inputs for GoogleScholarTool."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "Free-text search query (e.g. 'transformer interpretability', "
+            "'CRISPR gene editing', 'quantum error correction')."
+        ),
+    )
+    max_results: int = Field(
+        10, ge=1, le=20, description="Maximum number of papers to return (1–20)."
+    )
+    backend: Optional[Literal["selenium", "serpapi"]] = Field(
+        default=None,
+        description=(
+            "Override the backend for this call. 'selenium' is the free "
+            "default but is captcha-prone. 'serpapi' is paid and reliable; "
+            "requires SERPAPI_API_KEY. If omitted, falls back to the "
+            "GOOGLE_SCHOLAR_BACKEND env var, then 'selenium'."
+        ),
+    )
+
+
+def _resolve_scholar_backend(override: Optional[str]) -> str:
+    """Pick the backend: arg override → env var → 'selenium'."""
+    if override in ("selenium", "serpapi"):
+        return override
+    env = os.environ.get("GOOGLE_SCHOLAR_BACKEND", "selenium").lower()
+    return env if env in ("selenium", "serpapi") else "selenium"
+
+
+def _scholar_serpapi(query: str, max_results: int, api_key: str) -> str:
+    """Search via SerpAPI's Google Scholar endpoint.
+
+    SerpAPI is a paid service that proxies Google Scholar and returns
+    clean JSON.  Free tier gives 100 searches/month.  The endpoint URL
+    is documented at https://serpapi.com/google-scholar-api.
+    """
+    resp = requests.get(
+        "https://serpapi.com/search.json",
+        params={
+            "engine": "google_scholar",
+            "q": query,
+            "num": max_results,
+            "api_key": api_key,
+        },
+        timeout=SCHOLAR_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results: list[dict[str, Any]] = []
+    for item in data.get("organic_results", [])[:max_results]:
+        pub = item.get("publication_info", {}) or {}
+        results.append({
+            "title": item.get("title", ""),
+            "link": item.get("link", ""),
+            "snippet": item.get("snippet", ""),
+            "year": (pub.get("summary") or "").split(" - ")[0].strip() if pub.get("summary") else "",
+            "venue": (pub.get("summary") or "").split(" - ")[-1].strip() if pub.get("summary") else "",
+            "authors": [
+                a.get("name", "") for a in pub.get("authors", []) if a.get("name")
+            ],
+            "cited_by": item.get("cited_by", {}).get("value", 0)
+            if isinstance(item.get("cited_by"), dict) else 0,
+            "source": "serpapi",
+        })
+    return json.dumps(results, indent=2)
+
+
+def _scholar_selenium(query: str, max_results: int) -> str:
+    """Search via Selenium headless browser.
+
+    Reuses the SeleniumSearcher class that the app's WebSearchTool uses.
+    Returns a list of paper dicts with title / link / snippet / year /
+    venue / cited_by, parsed from the Scholar results page.  Scholar
+    aggressively detects bots, so this is best-effort and may captcha-block
+    on the first hit — the tool returns a JSON error in that case so the
+    agent can fall back to `openalex` or `web_search`.
+    """
+    # Lazy import so tools.py is importable in environments without
+    # Streamlit / Selenium already loaded.
+    try:
+        from app import SeleniumSearcher  # type: ignore
+    except Exception as exc:
+        return json.dumps({
+            "error": f"selenium backend unavailable: {exc}; "
+                     "try backend='serpapi' or use openalex / pubmed_search instead."
+        })
+
+    searcher = SeleniumSearcher(browser_type="chrome")
+    try:
+        # Scholar's HTML structure: each result is a <div class="gs_ri"> with
+        # an h3.gs_rt (title + link), div.gs_a (authors/venue/year), and
+        # div.gs_rs (snippet).  We use a slightly forgiving CSS to handle
+        # layout drift.
+        if not searcher._init_driver():
+            return json.dumps({"error": "failed to initialise Chrome for Scholar"})
+
+        url = f"https://scholar.google.com/scholar?q={requests.utils.quote(query)}&hl=en"
+        searcher.driver.get(url)
+        time.sleep(2)  # let the page settle; Scholar's anti-bot checks the
+                       # first second of activity
+        html = searcher.driver.page_source
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+
+        results: list[dict[str, Any]] = []
+        for div in soup.find_all("div", class_="gs_ri")[:max_results]:
+            try:
+                h3 = div.find("h3", class_="gs_rt")
+                if not h3:
+                    continue
+                a = h3.find("a")
+                title = h3.get_text(strip=True)
+                link = a.get("href", "") if a else ""
+                meta = div.find("div", class_="gs_a")
+                meta_text = meta.get_text(" ", strip=True) if meta else ""
+                # Meta line is typically "Authors - Venue, Year - Publisher".
+                parts = [p.strip() for p in meta_text.split(" - ")]
+                authors = parts[0] if parts else ""
+                venue = parts[1] if len(parts) > 1 else ""
+                year = parts[2] if len(parts) > 2 else ""
+                snippet_el = div.find("div", class_="gs_rs")
+                snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+
+                # Cited-by count is in a sibling footer <div class="gs_fl">;
+                # it's not always present, so we tolerate its absence.
+                cited_by = 0
+                fl = div.find("div", class_="gs_fl")
+                if fl:
+                    cited_link = fl.find("a", string=_re.compile(r"Cited by \d+"))
+                    if cited_link:
+                        m = _re.search(r"(\d+)", cited_link.get_text())
+                        if m:
+                            cited_by = int(m.group(1))
+
+                results.append({
+                    "title": title,
+                    "link": link,
+                    "snippet": snippet,
+                    "authors": authors,
+                    "venue": venue,
+                    "year": year,
+                    "cited_by": cited_by,
+                    "source": "scholar_selenium",
+                })
+            except Exception:
+                continue
+
+        if not results:
+            return json.dumps({
+                "error": (
+                    "no Scholar results extracted (likely a captcha or "
+                    "anti-bot block). Try backend='serpapi' or use "
+                    "openalex / pubmed_search instead."
+                )
+            })
+        return json.dumps(results, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": f"Scholar (selenium) failed: {exc}"})
+    finally:
+        try:
+            searcher.close()
+        except Exception:
+            pass
+
+
+class GoogleScholarTool(BaseTool):
+    """Search Google Scholar for academic papers."""
+
+    name: str = "google_scholar"
+    description: str = (
+        "Search Google Scholar for academic papers, theses, preprints, and "
+        "conference proceedings. Returns a JSON list of paper records (title, "
+        "link, snippet, authors, venue, year, cited_by). Use for "
+        "non-biomedical or cross-disciplinary topics where PubMed doesn't "
+        "apply, and as a complement to openalex. The default backend is "
+        "Selenium (free, captcha-prone); the paid SerpAPI backend is more "
+        "reliable and is enabled by setting SERPAPI_API_KEY and "
+        "GOOGLE_SCHOLAR_BACKEND=serpapi in the environment."
+    )
+    args_schema: type[BaseModel] = GoogleScholarInput
+
+    def _run(
+        self,
+        query: str,
+        max_results: int = 10,
+        backend: Optional[Literal["selenium", "serpapi"]] = None,
+    ) -> str:
+        """Search Google Scholar and return structured paper records."""
+        # Defensive clamping — same posture as the other tools.
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(20, n))
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+
+        chosen = _resolve_scholar_backend(backend)
+        if chosen == "serpapi":
+            api_key = os.environ.get("SERPAPI_API_KEY")
+            if not api_key:
+                return json.dumps({
+                    "error": (
+                        "backend='serpapi' requires SERPAPI_API_KEY. "
+                        "Either set the env var or omit `backend` to use "
+                        "the free Selenium path (with captcha risk)."
+                    )
+                })
+            try:
+                return _scholar_serpapi(query.strip(), n, api_key)
+            except requests.RequestException as exc:
+                return json.dumps({"error": f"SerpAPI network error: {exc}"})
+            except Exception as exc:
+                return json.dumps({"error": f"SerpAPI failed: {exc}"})
+
+        # Default: Selenium.
+        return _scholar_selenium(query.strip(), n)
+
+
+google_scholar_tool = GoogleScholarTool()
+
+
+# ===========================================================================
+# M1 — SequenceAlignmentTool
+# ===========================================================================
+# Wraps NCBI BLAST web service (blast.ncbi.nlm.nih.gov) for sequence
+# similarity search.  No API key required; NCBI throttles anonymous
+# usage at ~3 RPS, which `_EUtilsState.throttle()` already enforces.
+#
+# Five modes correspond to the five BLAST programs:
+#   - blastn    : nucleotide vs nucleotide
+#   - blastp    : protein vs protein
+#   - blastx    : nucleotide (translated) vs protein
+#   - tblastn   : protein vs nucleotide (translated)
+#   - tblastx   : nucleotide (translated) vs nucleotide (translated)
+#
+# A sixth mode, "msa", is a placeholder for future Biopython-MUSCLE
+# integration. For now it returns an explicit error so the agent
+# doesn't silently no-op.
+
+BLAST_BASE: str = "https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi"
+BLAST_TIMEOUT: int = 30
+
+
+class SequenceAlignmentInput(BaseModel):
+    """Inputs for SequenceAlignmentTool."""
+
+    sequence: str = Field(
+        ...,
+        description=(
+            "The query sequence as a FASTA string or a bare sequence. "
+            "Nucleotides for blastn/blastx/tblastx, amino acids for "
+            "blastp/tblastn. 20+ characters recommended."
+        ),
+    )
+    mode: Literal["blastn", "blastp", "blastx", "tblastn", "tblastx", "msa"] = Field(
+        "blastp",
+        description=(
+            "BLAST program. 'blastn' is nucleotide; 'blastp' is protein. "
+            "'msa' is reserved for future multiple-sequence alignment and "
+            "currently returns an error."
+        ),
+    )
+    database: str = Field(
+        "nr",
+        description=(
+            "BLAST database short name (e.g. 'nr', 'nt', 'refseq_protein', "
+            "'refseq_rna', 'pdbnt', 'pdbaa', 'swissprot'). See "
+            "https://ncbi.github.io/blast-cloud/ for the full list."
+        ),
+    )
+    max_hits: int = Field(
+        10, ge=1, le=50, description="Maximum number of hits to return (1–50)."
+    )
+
+
+def _submit_blast(sequence: str, program: str, database: str) -> str:
+    """Submit a BLAST job and return the Request ID (RID)."""
+    _EUtilsState.throttle()
+    resp = requests.post(
+        BLAST_BASE,
+        data={
+            "CMD": "Put",
+            "PROGRAM": program,
+            "DATABASE": database,
+            "QUERY": sequence,
+            "MEGABLAST": "on" if program == "blastn" else "",
+            "FORMAT_TYPE": "XML",
+            "NCBI_GI": "",
+            "TOOL": "research_agent_v4",
+        },
+        timeout=BLAST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    # NCBI returns the RID and estimated time-to-ready in the HTML body.
+    text = resp.text
+    rid = _re.search(r"RID = (\S+)", text)
+    if not rid:
+        raise ValueError("BLAST submit did not return a Request ID")
+    return rid.group(1)
+
+
+def _poll_blast(rid: str, max_wait_s: int = 60) -> str:
+    """Poll BLAST until the job is ready; return the XML body.
+
+    Polls every 3 seconds (NCBI's recommended interval) up to max_wait_s.
+    A real run of BLAST against nr typically completes in 15–45 seconds
+    for short queries; longer sequences or larger DBs may need more.
+    """
+    deadline = time.monotonic() + max_wait_s
+    while time.monotonic() < deadline:
+        _EUtilsState.throttle()
+        time.sleep(3)
+        resp = requests.get(
+            BLAST_BASE,
+            params={
+                "CMD": "Get",
+                "FORMAT_TYPE": "XML",
+                "RID": rid,
+                "TOOL": "research_agent_v4",
+            },
+            timeout=BLAST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        if "Status=READY" in resp.text:
+            return resp.text
+        if "Status=FAILED" in resp.text:
+            raise ValueError(f"BLAST job {rid} failed")
+    raise TimeoutError(f"BLAST job {rid} did not complete within {max_wait_s}s")
+
+
+def _parse_blast_xml(xml_text: str, max_hits: int) -> list[dict[str, Any]]:
+    """Extract a list of hits with title, accession, e-value, score, identity."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_text)
+    hits: list[dict[str, Any]] = []
+    for iteration in root.iter("Iteration"):
+        for hit in iteration.iter("Hit")[:max_hits]:
+            try:
+                hit_def = hit.findtext("Hit_def", default="", namespaces={}).strip()
+                hit_acc = hit.findtext("Hit_accession", default="", namespaces={})
+                hsps = hit.findall("Hsp")
+                if not hsps:
+                    continue
+                # First HSP (best) — extract the headline numbers.
+                hsp = hsps[0]
+                hits.append({
+                    "title": hit_def,
+                    "accession": hit_acc,
+                    "score": float(hsp.findtext("Hsp_score", default="0", namespaces={}) or 0),
+                    "evalue": float(hsp.findtext("Hsp_evalue", default="0", namespaces={}) or 0),
+                    "identity_pct": float(hsp.findtext("Hsp_identity", default="0", namespaces={}) or 0)
+                                   / max(1, float(hsp.findtext("Hsp_align-len", default="1", namespaces={}) or 1))
+                                   * 100.0,
+                    "alignment_length": int(hsp.findtext("Hsp_align-len", default="0", namespaces={}) or 0),
+                })
+            except Exception:
+                continue
+            if len(hits) >= max_hits:
+                break
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+
+class SequenceAlignmentTool(BaseTool):
+    """Run NCBI BLAST or future MSA against a query sequence."""
+
+    name: str = "sequence_align"
+    description: str = (
+        "Align a nucleotide or protein sequence against a public database "
+        "via NCBI BLAST. Returns the top hits with E-values, scores, and "
+        "percent identity. Use 'blastp' for protein queries (default), "
+        "'blastn' for nucleotide, 'blastx'/'tblastn'/'tblastx' for "
+        "translated searches. 'msa' (multiple-sequence alignment) is "
+        "reserved and currently returns an error. Requires 20+ character "
+        "queries for sensible results."
+    )
+    args_schema: type[BaseModel] = SequenceAlignmentInput
+
+    def _run(
+        self,
+        sequence: str,
+        mode: Literal["blastn", "blastp", "blastx", "tblastn", "tblastx", "msa"] = "blastp",
+        database: str = "nr",
+        max_hits: int = 10,
+    ) -> str:
+        """Run BLAST and return a JSON list of top hits."""
+        if mode == "msa":
+            return json.dumps({
+                "error": "MSA mode is not yet implemented; use 'blastp' or 'blastn' instead."
+            })
+        if not sequence or len(sequence.strip()) < 10:
+            return json.dumps({
+                "error": "sequence is too short; provide at least 10 characters."
+            })
+        try:
+            n = int(max_hits)
+        except (TypeError, ValueError):
+            n = 10
+        n = max(1, min(50, n))
+        try:
+            rid = _submit_blast(sequence.strip(), mode, database)
+            xml = _poll_blast(rid, max_wait_s=60)
+            hits = _parse_blast_xml(xml, n)
+            return json.dumps({
+                "rid": rid,
+                "program": mode,
+                "database": database,
+                "hit_count": len(hits),
+                "hits": hits,
+            }, indent=2)
+        except requests.RequestException as exc:
+            return json.dumps({"error": f"BLAST network error: {exc}"})
+        except TimeoutError as exc:
+            return json.dumps({"error": str(exc)})
+        except Exception as exc:
+            return json.dumps({"error": f"BLAST failed: {exc}"})
+
+
+sequence_alignment_tool = SequenceAlignmentTool()
+
+
+# ===========================================================================
+# M2 — StructureLookupTool
+# ===========================================================================
+# Looks up 3D structure files (PDB or mmCIF) and metadata from RCSB PDB
+# or the AlphaFold DB.  Two sources, one tool:
+#
+#   - "pdb"        → RCSB PDB REST API (data.rcsb.org)
+#   - "alphafold"  → AlphaFold DB REST API (alphafold.ebi.ac.uk)
+#
+# For each, the tool returns:
+#   - metadata (resolution, method, title, etc.)
+#   - a download path under per-session "structures/<id>.<ext>"
+#   - the raw URL the agent can mention in citations
+
+PDB_BASE: str = "https://data.rcsb.org/rest/v1/core"
+ALPHAFOLD_BASE: str = "https://alphafold.ebi.ac.uk/api"
+STRUCTURES_DIR: str = "structures"
+STRUCTURE_HTTP_TIMEOUT: int = 30
+
+
+class StructureLookupInput(BaseModel):
+    """Inputs for StructureLookupTool."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "Structure identifier. For source='pdb', a 4-character PDB ID "
+            "(e.g. '1A2B', '6VXX'). For source='alphafold', a UniProt "
+            "accession (e.g. 'P0DTC2') or an AlphaFold DB ID (e.g. "
+            "'AF-P0DTC2-F1')."
+        ),
+    )
+    source: Literal["pdb", "alphafold"] = Field(
+        "pdb",
+        description="Structure source: 'pdb' for RCSB, 'alphafold' for EBI AlphaFold DB.",
+    )
+
+
+def _lookup_pdb(pdb_id: str) -> dict[str, Any]:
+    """Fetch PDB metadata; download the mmCIF to structures/<id>.cif."""
+    pdb_id = pdb_id.upper().strip()
+    if not _re.match(r"^[1-9][A-Z0-9]{3}$", pdb_id):
+        raise ValueError(f"invalid PDB id format: {pdb_id!r}")
+    meta_resp = requests.get(f"{PDB_BASE}/entry/{pdb_id}", timeout=STRUCTURE_HTTP_TIMEOUT)
+    meta_resp.raise_for_status()
+    meta = meta_resp.json()
+
+    # Try to find a method/resolution summary.
+    exptl = (meta.get("exptl") or [{}])[0]
+    method = exptl.get("method", "")
+    resolution = ""
+    refine = (meta.get("refine") or [{}])
+    if refine and isinstance(refine, list) and refine[0]:
+        for entry in refine:
+            for line in entry.get("ls_d_res_high", []) if isinstance(entry.get("ls_d_res_high"), list) else []:
+                resolution = line.strip()
+                break
+            if resolution:
+                break
+
+    # Download mmCIF.
+    cif_url = f"https://files.rcsb.org/download/{pdb_id}.cif"
+    cif_resp = requests.get(cif_url, timeout=STRUCTURE_HTTP_TIMEOUT)
+    cif_resp.raise_for_status()
+    os.makedirs(STRUCTURES_DIR, exist_ok=True)
+    out_path = os.path.join(STRUCTURES_DIR, f"{pdb_id}.cif")
+    with open(out_path, "wb") as fh:
+        fh.write(cif_resp.content)
+
+    return {
+        "source": "pdb",
+        "id": pdb_id,
+        "title": (meta.get("struct") or {}).get("title", ""),
+        "method": method,
+        "resolution_angstrom": resolution,
+        "released": (meta.get("rcsb_accession_info") or {}).get("initial_release_date", "")[:10],
+        "url": f"https://www.rcsb.org/structure/{pdb_id}",
+        "mmcif_path": out_path,
+        "mmcif_url": cif_url,
+    }
+
+
+def _lookup_alphafold(uniprot_or_af_id: str) -> dict[str, Any]:
+    """Fetch AlphaFold metadata; download the PDB-format model."""
+    q = uniprot_or_af_id.strip()
+    if q.startswith("AF-") and q.endswith("-F1"):
+        af_id = q
+        uniprot = q[3:].rsplit("-", 1)[0]
+    else:
+        af_id = f"AF-{q}-F1"
+        uniprot = q
+
+    url = f"{ALPHAFOLD_BASE}/prediction/{af_id}"
+    resp = requests.get(url, timeout=STRUCTURE_HTTP_TIMEOUT)
+    if resp.status_code == 404:
+        # Try the bare UniProt endpoint as a fallback.
+        url2 = f"{ALPHAFOLD_BASE}/prediction/{uniprot}"
+        resp = requests.get(url2, timeout=STRUCTURE_HTTP_TIMEOUT)
+    resp.raise_for_status()
+    meta = resp.json()
+    if isinstance(meta, list) and meta:
+        meta = meta[0]
+    pdb_url = meta.get("pdbUrl") or meta.get("cifUrl") or ""
+    if not pdb_url:
+        raise ValueError(f"no model URL in AlphaFold response for {af_id}")
+
+    pdb_resp = requests.get(pdb_url, timeout=STRUCTURE_HTTP_TIMEOUT)
+    pdb_resp.raise_for_status()
+    os.makedirs(STRUCTURES_DIR, exist_ok=True)
+    ext = "pdb" if pdb_url.endswith(".pdb") else "cif"
+    out_path = os.path.join(STRUCTURES_DIR, f"{af_id}.{ext}")
+    with open(out_path, "wb") as fh:
+        fh.write(pdb_resp.content)
+
+    return {
+        "source": "alphafold",
+        "id": af_id,
+        "uniprot": uniprot,
+        "organism": meta.get("organismScientificName", ""),
+        "uniprot_description": meta.get("uniprotDescription", ""),
+        "global_pLDDT": meta.get("globalMetricValue", ""),
+        "model_created": (meta.get("modelCreatedDate") or "")[:10],
+        "url": f"https://alphafold.ebi.ac.uk/entry/{af_id}",
+        "model_path": out_path,
+        "model_url": pdb_url,
+    }
+
+
+class StructureLookupTool(BaseTool):
+    """Look up a 3D structure from PDB or AlphaFold DB."""
+
+    name: str = "structure_lookup"
+    description: str = (
+        "Retrieve a 3D structure file (PDB mmCIF or AlphaFold model) and "
+        "metadata from RCSB PDB or AlphaFold DB. For source='pdb', provide "
+        "a 4-character PDB ID (e.g. '6VXX'). For source='alphafold', "
+        "provide a UniProt accession (e.g. 'P0DTC2') or AlphaFold ID "
+        "(e.g. 'AF-P0DTC2-F1'). Returns the metadata, a local path to the "
+        "downloaded coordinate file under structures/, and the source URL."
+    )
+    args_schema: type[BaseModel] = StructureLookupInput
+
+    def _run(self, query: str, source: Literal["pdb", "alphafold"] = "pdb") -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            if source == "pdb":
+                return json.dumps(_lookup_pdb(query), indent=2)
+            return json.dumps(_lookup_alphafold(query), indent=2)
+        except requests.RequestException as exc:
+            return json.dumps({"error": f"structure lookup network error: {exc}"})
+        except Exception as exc:
+            return json.dumps({"error": f"structure lookup failed: {exc}"})
+
+
+structure_lookup_tool = StructureLookupTool()
+
+
+# ===========================================================================
+# H4 — NCBIGenomicsTool
+# ===========================================================================
+# One tool, five entity types, all backed by NCBI E-utilities (the same
+# E-utilities endpoints `PubMedSearchTool` uses) plus the NCBI Datasets
+# v2 API for gene records.  This keeps the implementation zero-new-deps:
+#
+#   entity='gene'       → NCBI Datasets v2 (api.ncbi.nlm.nih.gov/datasets/v2/)
+#   entity='nuccore'    → E-utilities efetch (returns a FASTA snippet)
+#   entity='protein'    → E-utilities efetch
+#   entity='structure'  → Cross-ref to StructureLookupTool (summary only)
+#   entity='variant'    → NCBI ClinVar E-utilities (esearch + esummary)
+#
+# Where the response is large, we truncate the FASTA to 5 KB — enough for
+# the agent to confirm what it got, with the accession number preserved
+# so the user can fetch the full record downstream.
+
+NCBI_DATASETS_BASE: str = "https://api.ncbi.nlm.nih.gov/datasets/v2"
+CLINVAR_ESearch: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+CLINVAR_ESummary: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+
+
+class NCBIGenomicsInput(BaseModel):
+    """Inputs for NCBIGenomicsTool."""
+
+    entity: Literal["gene", "nuccore", "protein", "structure", "variant"] = Field(
+        ...,
+        description=(
+            "Type of record. 'gene' for gene summaries, 'nuccore' for a "
+            "nucleotide FASTA, 'protein' for a protein FASTA, 'structure' "
+            "for a PDB structure summary, 'variant' for a ClinVar variant "
+            "record."
+        ),
+    )
+    query: str = Field(
+        ...,
+        description=(
+            "Accession or identifier. Examples: gene symbol 'TP53', RefSeq "
+            "nucleotide 'NM_000546', RefSeq protein 'NP_000537', PDB ID "
+            "'6VXX', or a ClinVar variation ID like '12345'."
+        ),
+    )
+    max_results: int = Field(
+        5, ge=1, le=20, description="Maximum number of records to return (1–20)."
+    )
+
+
+def _gene_lookup(query: str) -> dict[str, Any]:
+    """NCBI Datasets v2 gene report — returns gene metadata + RefSeq links."""
+    resp = requests.get(
+        f"{NCBI_DATASETS_BASE}/gene/symbol/{requests.utils.quote(query)}",
+        params={"page_size": "1"},
+        timeout=STRUCTURE_HTTP_TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    reports = payload.get("reports", [])
+    if not reports:
+        raise ValueError(f"no gene report found for {query!r}")
+    rep = reports[0]
+    gene = rep.get("gene", {})
+    return {
+        "entity": "gene",
+        "symbol": gene.get("symbol", query),
+        "name": gene.get("description", ""),
+        "chromosome": gene.get("chromosomes", [""])[0] if gene.get("chromosomes") else "",
+        "map_location": gene.get("map_location", ""),
+        "type": gene.get("type", ""),
+        "refseq_nucleotide": [
+            t.get("accession_version", "") for t in rep.get("transcripts", [])
+            if t.get("accession_version", "").startswith("NM_")
+        ][:5],
+        "refseq_protein": [
+            t.get("accession_version", "") for t in rep.get("transcripts", [])
+            if t.get("accession_version", "").startswith("NP_")
+        ][:5],
+        "url": f"https://www.ncbi.nlm.nih.gov/gene/{gene.get('gene_id', '')}",
+        "source": "ncbi_datasets_v2",
+    }
+
+
+def _efetch_fasta(db: str, accession: str) -> str:
+    """Fetch the first 5 KB of a FASTA record for *accession* in *db*."""
+    _EUtilsState.throttle()
+    resp = requests.get(
+        f"{EUTILS_BASE}/efetch.fcgi",
+        params=_eutils_params({
+            "id": accession,
+            "db": db,
+            "rettype": "fasta",
+            "retmode": "text",
+        }),
+        timeout=STRUCTURE_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    text = resp.text
+    return text[:5120] + ("\n[... truncated ...]" if len(text) > 5120 else "")
+
+
+def _variant_lookup(query: str) -> dict[str, Any]:
+    """ClinVar variant record by variation ID."""
+    # Query may be a numeric variation ID or a free-text term.
+    if query.strip().isdigit():
+        var_ids = [query.strip()]
+    else:
+        _EUtilsState.throttle()
+        resp = requests.get(
+            CLINVAR_ESearch,
+            params=_eutils_params({
+                "db": "clinvar",
+                "term": query,
+                "retmax": "5",
+                "retmode": "json",
+            }),
+            timeout=STRUCTURE_HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        var_ids = resp.json().get("esearchresult", {}).get("idlist", [])
+    if not var_ids:
+        raise ValueError(f"no ClinVar variants found for {query!r}")
+    _EUtilsState.throttle()
+    resp = requests.get(
+        CLINVAR_ESummary,
+        params=_eutils_params({
+            "db": "clinvar",
+            "id": ",".join(var_ids),
+            "retmode": "json",
+        }),
+        timeout=STRUCTURE_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    result = resp.json().get("result", {})
+    records = []
+    for vid in var_ids:
+        rec = result.get(vid, {})
+        if not isinstance(rec, dict):
+            continue
+        germ = rec.get("germline_classification", {}) or {}
+        records.append({
+            "variation_id": vid,
+            "title": rec.get("title", ""),
+            "clinical_significance": germ.get("description", ""),
+            "review_status": germ.get("review_status", ""),
+            "trait": (rec.get("trait_set") or [{}])[0].get("trait_name", "")
+                      if rec.get("trait_set") else "",
+            "url": f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{vid}/",
+        })
+    return {"entity": "variant", "source": "clinvar", "records": records}
+
+
+class NCBIGenomicsTool(BaseTool):
+    """Look up gene / nucleotide / protein / structure / variant records."""
+
+    name: str = "ncbi_genomics"
+    description: str = (
+        "Query NCBI for genomics records. 'gene' returns gene metadata and "
+        "RefSeq links (NCBI Datasets v2). 'nuccore' returns a FASTA snippet "
+        "for a RefSeq nucleotide accession (NM_/NR_/XM_). 'protein' returns "
+        "a FASTA snippet for a RefSeq protein accession (NP_/XP_). "
+        "'structure' returns a PDB structure summary. 'variant' returns a "
+        "ClinVar variant record by variation ID or free-text query."
+    )
+    args_schema: type[BaseModel] = NCBIGenomicsInput
+
+    def _run(
+        self,
+        entity: Literal["gene", "nuccore", "protein", "structure", "variant"],
+        query: str,
+        max_results: int = 5,
+    ) -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        try:
+            n = int(max_results)
+        except (TypeError, ValueError):
+            n = 5
+        n = max(1, min(20, n))
+
+        try:
+            if entity == "gene":
+                return json.dumps(_gene_lookup(query.strip()), indent=2)
+            if entity == "nuccore":
+                fasta = _efetch_fasta("nuccore", query.strip())
+                return json.dumps({
+                    "entity": "nuccore",
+                    "accession": query.strip(),
+                    "fasta_snippet": fasta,
+                }, indent=2)
+            if entity == "protein":
+                fasta = _efetch_fasta("protein", query.strip())
+                return json.dumps({
+                    "entity": "protein",
+                    "accession": query.strip(),
+                    "fasta_snippet": fasta,
+                }, indent=2)
+            if entity == "structure":
+                # Structure summaries piggyback on the structure_lookup
+                # tool so we don't fork the PDB code.
+                try:
+                    summary = _lookup_pdb(query.strip())
+                    # Drop the heavy mmcif_path/cif for the summary view.
+                    summary = {k: v for k, v in summary.items()
+                               if k not in ("mmcif_path",)}
+                    return json.dumps(summary, indent=2)
+                except Exception as exc:
+                    return json.dumps({
+                        "entity": "structure",
+                        "error": f"PDB lookup failed: {exc}; "
+                                 "the structure_lookup tool handles full file download."
+                    })
+            if entity == "variant":
+                return json.dumps(_variant_lookup(query.strip()), indent=2)
+            return json.dumps({"error": f"unknown entity: {entity}"})
+        except requests.RequestException as exc:
+            return json.dumps({"error": f"NCBI genomics network error: {exc}"})
+        except Exception as exc:
+            return json.dumps({"error": f"NCBI genomics failed: {exc}"})
+
+
+ncbi_genomics_tool = NCBIGenomicsTool()
+
+
+# ===========================================================================
+# H5 — AntibodyTherapeuticTool
+# ===========================================================================
+# Aggregates antibody-specific data from five sources, returning one
+# unified JSON record per query:
+#
+#   - IEDB           → epitope records (iedb.org)
+#   - Thera-SAbDab   → therapeutic antibody metadata (opig.stats.ox.ac.uk)
+#   - CoV-AbDab      → coronavirus antibody database
+#   - SAbDab         → structural antibody database
+#   - PDB            → cross-referenced structure entries
+#
+# The aggregation policy: collect whatever each source returns, label
+# each item with a `source` field, and merge them under the query.  The
+# agent sees a single record with provenance for every line, so it can
+# cite correctly without guessing where a fact came from.
+#
+# This tool deliberately returns a flat list rather than a deep tree —
+# flat lists are easier for the LLM to scan and reason about.
+
+THERASABDAB_BASE: str = "https://opig.stats.ox.ac.uk/webapps/therasabdab"
+COVABDAB_BASE: str = "http://opig.stats.ox.ac.uk/webapps/covabdab"
+SABDAB_BASE: str = "http://opig.stats.ox.ac.uk/webapps/sabdab"
+ANTIBODY_HTTP_TIMEOUT: int = 20
+
+
+class AntibodyTherapeuticInput(BaseModel):
+    """Inputs for AntibodyTherapeuticTool."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "Antibody name (e.g. 'pembrolizumab', 'casirivimab'), target "
+            "(e.g. 'PD-1', 'SARS-CoV-2 spike'), or INN / brand name. "
+            "Free-text matching across all five sources."
+        ),
+    )
+    query_type: Literal["name", "target"] = Field(
+        "name",
+        description=(
+            "'name' for an antibody identifier, 'target' for an antigen "
+            "name. Affects which fields are searched in each source."
+        ),
+    )
+
+
+def _therasabdab_lookup(query: str) -> list[dict[str, Any]]:
+    """Thera-SAbDab — therapeutic antibodies in clinical development."""
+    try:
+        resp = requests.get(
+            f"{THERASABDAB_BASE}/search/{requests.utils.quote(query)}",
+            headers={"Accept": "application/json"},
+            timeout=ANTIBODY_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        results = data if isinstance(data, list) else data.get("results", [])
+        out = []
+        for r in results[:10]:
+            out.append({
+                "source": "therasabdab",
+                "name": r.get("name", ""),
+                "inn": r.get("inn", ""),
+                "target": r.get("target", ""),
+                "format": r.get("format", ""),
+                "phase": r.get("highest_clinical_phase", ""),
+                "isotype": r.get("isotype", ""),
+                "url": f"https://opig.stats.ox.ac.uk/webapps/therasabdab/therasabdab/{r.get('name', '')}",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _covabdab_lookup(query: str) -> list[dict[str, Any]]:
+    """CoV-AbDab — coronavirus neutralising antibodies and binding data."""
+    try:
+        resp = requests.get(
+            f"{COVABDAB_BASE}/search",
+            params={"search": query, "format": "json"},
+            timeout=ANTIBODY_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for r in rows[:10]:
+            out.append({
+                "source": "covabdab",
+                "name": r.get("Name", r.get("name", "")),
+                "origin": r.get("Origin", ""),
+                "v_gene": r.get("VHgene", ""),
+                "j_gene": r.get("JHgene", ""),
+                "target": ", ".join(r.get("Sources", []) or []) if isinstance(r.get("Sources"), list) else "",
+                "neutralising": r.get("Neutralising vs", ""),
+                "url": f"http://opig.stats.ox.ac.uk/webapps/covabdab/{r.get('Name', '')}",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _sabdab_lookup(query: str) -> list[dict[str, Any]]:
+    """SAbDab — structural antibody database (PDB cross-references)."""
+    try:
+        resp = requests.get(
+            f"{SABDAB_BASE}/search",
+            params={"search": query, "format": "json"},
+            timeout=ANTIBODY_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for r in rows[:10]:
+            out.append({
+                "source": "sabdab",
+                "pdb": r.get("pdb", ""),
+                "name": r.get("antibody_name", ""),
+                "heavy_species": r.get("heavy_species", ""),
+                "light_species": r.get("light_species", ""),
+                "resolution": r.get("resolution", ""),
+                "method": r.get("method", ""),
+                "antigen": r.get("antigen_name", ""),
+                "url": f"https://www.ebi.ac.uk/pdbe/entry/pdb/{r.get('pdb', '')}",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _iedb_lookup(query: str) -> list[dict[str, Any]]:
+    """IEDB — Immune Epitope Database, epitope records."""
+    try:
+        # IEDB's search API is open and returns JSON. The exact endpoint
+        # is documented at https://www.iedb.org/database_export_v3.html.
+        resp = requests.get(
+            "https://query-api.iedb.org/epitope_search",
+            params={
+                "query": query,
+                "select": "epitope_id,epitope_type,source_organism,source_antigen,structure_type",
+                "limit": "10",
+            },
+            timeout=ANTIBODY_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        rows = resp.json() if isinstance(resp.json(), list) else []
+        return [
+            {
+                "source": "iedb",
+                "epitope_id": r.get("epitope_id", ""),
+                "epitope_type": r.get("epitope_type", ""),
+                "source_organism": r.get("source_organism", ""),
+                "antigen": r.get("source_antigen", ""),
+                "structure_type": r.get("structure_type", ""),
+                "url": f"https://www.iedb.org/epitope/{r.get('epitope_id', '')}",
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+class AntibodyTherapeuticTool(BaseTool):
+    """Look up antibody therapeutic and structural records."""
+
+    name: str = "antibody_therapeutic"
+    description: str = (
+        "Look up antibody sequence, paratope, epitope, and therapeutic "
+        "feasibility data by aggregating IEDB (epitopes), Thera-SAbDab "
+        "(clinical-stage therapeutics), CoV-AbDab (coronavirus antibodies), "
+        "SAbDab (PDB cross-references), and PDB structure entries. Accepts "
+        "an antibody name (e.g. 'pembrolizumab') or target (e.g. 'PD-1'). "
+        "Returns a unified record with explicit `source` field per item."
+    )
+    args_schema: type[BaseModel] = AntibodyTherapeuticInput
+
+    def _run(
+        self,
+        query: str,
+        query_type: Literal["name", "target"] = "name",
+    ) -> str:
+        if not query or not query.strip():
+            return json.dumps({"error": "empty query"})
+        q = query.strip()
+        # Run all five lookups; each one tolerates its own failure and
+        # returns an empty list rather than raising. We aggregate whatever
+        # comes back.
+        thera = _therasabdab_lookup(q)
+        cov = _covabdab_lookup(q)
+        sab = _sabdab_lookup(q)
+        iedb = _iedb_lookup(q)
+        total = len(thera) + len(cov) + len(sab) + len(iedb)
+        if total == 0:
+            return json.dumps({
+                "query": q,
+                "query_type": query_type,
+                "result_count": 0,
+                "records": [],
+                "message": "no antibody records found across the five sources; "
+                           "try a different name or target.",
+            }, indent=2)
+        return json.dumps({
+            "query": q,
+            "query_type": query_type,
+            "result_count": total,
+            "therasabdab": thera,
+            "covabdab": cov,
+            "sabdab": sab,
+            "iedb": iedb,
+        }, indent=2)
+
+
+antibody_therapeutic_tool = AntibodyTherapeuticTool()
+
+
+# ===========================================================================
+# M7 — FigureCaptionTool
+# ===========================================================================
+# Generates a structured caption for a single image file (PNG, JPG, TIFF)
+# or a PDF page rendered as an image.  Uses a local Ollama vision model
+# (llama3.2-vision, gemma3:27b-vision, or llava) and returns a small
+# JSON record with figure type, axes, key result, and a take-home sentence.
+#
+# The vision-model selection mirrors the same auto-detect pattern the
+# multimodal extract tool uses — see the Ollama vision model hint
+# priority in `_OLLAMA_VISION_HINTS`.
+
+import base64 as _base64
+from pathlib import Path as _Path
+
+_OLLAMA_VISION_HINTS = (
+    "llama3.2-vision",
+    "gemma3:27b-vision", "gemma3-vision",
+    "llava", "llava-phi3",
+    "minicpm-v",
+)
+OLLAMA_GENERATE_URL: str = "http://localhost:11434/api/generate"
+
+
+class FigureCaptionInput(BaseModel):
+    """Inputs for FigureCaptionTool."""
+
+    image_path: str = Field(
+        ...,
+        description="Local path to an image file (PNG, JPG, JPEG, TIFF) "
+                    "or a single-page PDF to render and caption."
+    )
+    hint: Optional[str] = Field(
+        default=None,
+        description="Optional context to bias the caption, e.g. "
+                    "'Figure 3 from PMID 12345' or 'Results panel B'."
+    )
+
+
+def _detect_vision_model() -> Optional[str]:
+    """Return the first installed Ollama vision model, or None."""
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+        resp.raise_for_status()
+        models = [m.get("name", "") for m in resp.json().get("models", [])]
+    except Exception:
+        return None
+    for hint in _OLLAMA_VISION_HINTS:
+        for m in models:
+            if m.startswith(hint):
+                return m
+    return None
+
+
+def _ensure_image_png(path: str) -> bytes:
+    """Return PNG bytes for *path*. Renders the first page if it's a PDF."""
+    p = _Path(path)
+    if not p.exists():
+        raise FileNotFoundError(path)
+    if p.suffix.lower() == ".pdf":
+        # Render first page via PyMuPDF (already a project dependency).
+        import fitz  # type: ignore
+        doc = fitz.open(path)
+        if not doc:
+            raise ValueError(f"empty PDF: {path}")
+        page = doc[0]
+        pix = page.get_pixmap(dpi=150)
+        return pix.tobytes("png")
+    # Otherwise trust the file as-is.
+    return p.read_bytes()
+
+
+def _caption_with_ollama(image_bytes: bytes, hint: Optional[str], model: str) -> str:
+    """POST a base64 image to Ollama's /api/generate with a vision prompt."""
+    img_b64 = _base64.b64encode(image_bytes).decode("ascii")
+    prompt = (
+        "You are a scientific figure captioner. Describe the image in a "
+        "structured way. Return ONLY valid JSON with these keys: "
+        "`figure_type` (chart / micrograph / diagram / photo / other), "
+        "`axes` (list of axis labels, or []), "
+        "`key_result` (one sentence), "
+        "`take_home` (one sentence a non-expert would understand)."
+    )
+    if hint:
+        prompt += f" Context: {hint}."
+    try:
+        resp = requests.post(
+            OLLAMA_GENERATE_URL,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "images": [img_b64],
+                "stream": False,
+                "format": "json",
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "")
+    except Exception as exc:
+        return json.dumps({"error": f"Ollama vision call failed: {exc}"})
+
+
+class FigureCaptionTool(BaseTool):
+    """Caption a single image using a local vision model."""
+
+    name: str = "caption_image"
+    description: str = (
+        "Generate a structured caption for a single image or a single PDF "
+        "page rendered as an image. Uses a local Ollama vision model "
+        "(llama3.2-vision, gemma3:27b-vision, or llava) and returns a JSON "
+        "record with figure_type, axes, key_result, and take_home fields. "
+        "Use when a specific figure needs explanation without re-extracting "
+        "the entire source document."
+    )
+    args_schema: type[BaseModel] = FigureCaptionInput
+
+    def _run(
+        self,
+        image_path: str,
+        hint: Optional[str] = None,
+    ) -> str:
+        if not image_path or not image_path.strip():
+            return json.dumps({"error": "empty image_path"})
+        try:
+            image_bytes = _ensure_image_png(image_path.strip())
+        except FileNotFoundError:
+            return json.dumps({"error": f"file not found: {image_path}"})
+        except Exception as exc:
+            return json.dumps({"error": f"could not load image: {exc}"})
+
+        model = _detect_vision_model()
+        if not model:
+            return json.dumps({
+                "error": (
+                    "no Ollama vision model found. Pull one with "
+                    "'ollama pull llama3.2-vision' (or gemma3:27b-vision / llava) "
+                    "and ensure Ollama is running at localhost:11434."
+                )
+            })
+
+        raw = _caption_with_ollama(image_bytes, hint, model)
+        # Try to parse the model's JSON; if it returned a string, wrap it.
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {"raw_response": raw}
+        parsed["image_path"] = image_path
+        parsed["model"] = model
+        return json.dumps(parsed, indent=2)
+
+
+figure_caption_tool = FigureCaptionTool()

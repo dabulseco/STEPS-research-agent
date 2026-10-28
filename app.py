@@ -17,7 +17,20 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import streamlit as st
 from rag import DocumentStore, classify_embedding_models
-from tools import local_kb_tool, pubmed_search_tool, citation_resolver_tool
+from tools import (
+    local_kb_tool,
+    pubmed_search_tool,
+    citation_resolver_tool,
+    openalex_tool,
+    url_fetch_tool,
+    reference_manager_tool,
+    google_scholar_tool,
+    sequence_alignment_tool,
+    structure_lookup_tool,
+    ncbi_genomics_tool,
+    antibody_therapeutic_tool,
+    figure_caption_tool,
+)
 from crewai import Agent, Task, Crew, Process
 
 try:
@@ -91,6 +104,15 @@ if 'output_format_selected' not in st.session_state:
     st.session_state.output_format_selected = False
 if 'written_output' not in st.session_state:
     st.session_state.written_output = None
+# Biomedical mode toggle (Stage 0) and Stage 2b/2c outputs
+if 'biomedical_mode' not in st.session_state:
+    st.session_state.biomedical_mode = False
+if 'multimodal_mode' not in st.session_state:
+    st.session_state.multimodal_mode = False
+if 'bio_curation' not in st.session_state:
+    st.session_state.bio_curation = None
+if 'figure_reading' not in st.session_state:
+    st.session_state.figure_reading = None
 
 # Custom resources (URLs and PDFs)
 if 'custom_resources' not in st.session_state:
@@ -1207,6 +1229,189 @@ def step3_gap_analysis(
 
     return str(result)
 
+
+# ---------------------------------------------------------------------------
+# Step 2b: Bio Curation (only when biomedical_mode is on)
+# ---------------------------------------------------------------------------
+# A dedicated agent that calls the bio-domain tools (NCBI genomics, BLAST,
+# structure lookup, antibody therapeutic) to assemble structured primary
+# data on genes, proteins, variants, structures, and antibodies identified
+# in the gap analysis. The output is plain markdown that is then fed
+# into Stage 3 (Web Research) and eventually Stage 5 (Writing).
+def step2b_bio_curation(
+    research_plan: str,
+    initial_research: str,
+    gap_analysis: str,
+    llm,
+    context: str = "",
+    resources: str = "",
+):
+    """Run the Bio Curator agent over the gap analysis."""
+    st.subheader("Step 2b: Bio Curation")
+    llm_string = f"ollama/{llm.model}"
+
+    bio_curator_agent = Agent(
+        role="Bio Curator",
+        goal=(
+            "Resolve the biomedical entities in the research plan and gap "
+            "analysis into structured primary data: gene records, protein "
+            "FASTA snippets, structure files, BLAST hits, variant "
+            "significance, and antibody therapeutic metadata. Cite every "
+            "claim with the source record (NCBI gene ID, PDB ID, UniProt, "
+            "Thera-SAbDab, etc.)."
+        ),
+        backstory=(
+            "You are a domain curator who pulls authoritative records from "
+            "NCBI, RCSB PDB, AlphaFold DB, and antibody databases. You "
+            "prefer RefSeq / UniProt primary IDs over free-text names. When "
+            "a tool returns an error, you note it and continue rather than "
+            "halting the run."
+        ),
+        llm=llm_string,
+        tools=[
+            ncbi_genomics_tool,          # H4
+            sequence_alignment_tool,     # M1
+            structure_lookup_tool,       # M2
+            antibody_therapeutic_tool,   # H5
+            local_kb_tool,               # M6 (for cross-references in user uploads)
+        ],
+        verbose=True,
+        allow_delegation=False,
+        max_iter=10,
+    )
+
+    bio_task = Task(
+        description=f"""
+        Research plan:
+        {research_plan}
+
+        Initial research:
+        {initial_research[:1500]}
+
+        Gap analysis:
+        {gap_analysis}
+        {context}
+        {resources}
+
+        For each gene / protein / antibody / variant / structure mentioned
+        in the gap analysis, call the relevant tool and produce a markdown
+        report. Suggested workflow:
+
+        1. For each gene symbol mentioned, call `ncbi_genomics` with
+           entity='gene' to get the RefSeq accession list.
+        2. For protein-coding transcripts, call `ncbi_genomics` with
+           entity='protein' to fetch a FASTA snippet.
+        3. For antibodies, call `antibody_therapeutic` with the antibody
+           name or target to get Thera-SAbDab / CoV-AbDab / SAbDab records.
+        4. For PDB IDs, call `structure_lookup` with source='pdb' to
+           download the mmCIF and pull resolution / method.
+        5. For ClinVar variants, call `ncbi_genomics` with entity='variant'.
+
+        End with a one-paragraph synthesis: which entities are central to
+        the user's question, what is well-established vs. uncertain, and
+        which sources were unreachable.
+        """,
+        agent=bio_curator_agent,
+        expected_output=(
+            "Structured markdown report of biomedical entities with "
+            "explicit NCBI / PDB / Thera-SAbDab / ClinVar source citations."
+        ),
+    )
+
+    crew = Crew(
+        agents=[bio_curator_agent],
+        tasks=[bio_task],
+        process=Process.sequential,
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False,
+    )
+    with st.spinner("Curating biomedical records..."):
+        result = crew.kickoff()
+    return str(result)
+
+
+# ---------------------------------------------------------------------------
+# Step 2c: Figure Reading (only when multimodal_mode is on AND PDFs uploaded)
+# ---------------------------------------------------------------------------
+# Renders each figure from uploaded PDFs into PNG, captions it via the
+# local vision model, and writes a markdown summary. The captions flow
+# into the local KB via DocumentStore so the Writer can pull them.
+def step2c_figure_reading(
+    research_plan: str,
+    llm,
+    doc_store: "DocumentStore | None" = None,
+    session_id: str = "",
+):
+    """Caption figures from uploaded PDFs using a local vision model.
+
+    This stage is best-effort: if no PDFs were uploaded, or no vision
+    model is available, it returns a short note rather than failing.
+    """
+    st.subheader("Step 2c: Figure Reading")
+    resources = st.session_state.get("custom_resources", []) or []
+    pdf_resources = [r for r in resources if r.get("type") == "pdf"]
+    if not pdf_resources:
+        st.info("No PDFs uploaded; skipping figure reading.")
+        return ("# Figure Reading\n\n_No PDFs were uploaded in this "
+                "session, so figure reading was skipped._")
+
+    # Use the multimodal extract tool's image-extraction path. It
+    # already returns figure paths under session_figures/<id>/.
+    try:
+        from tools_multimodal import MultimodalExtractTool  # type: ignore
+    except Exception as exc:
+        return (f"# Figure Reading\n\n_Multimodal module unavailable: {exc}._")
+
+    extract = MultimodalExtractTool()
+    captions: list[str] = ["# Figure Captions\n"]
+    for res in pdf_resources:
+        path = res.get("path", "")
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            result = extract._run(
+                source=path, extract=["figures"], max_figures=10
+            )
+            data = json.loads(result) if isinstance(result, str) else result
+        except Exception as exc:
+            captions.append(f"\n## {os.path.basename(path)}\n\n_Extraction failed: {exc}_\n")
+            continue
+        figures = data.get("figures", []) if isinstance(data, dict) else []
+        if not figures:
+            captions.append(f"\n## {os.path.basename(path)}\n\n_No figures detected._\n")
+            continue
+        for fig in figures:
+            fig_path = fig.get("image_path", "")
+            if not fig_path or not os.path.exists(fig_path):
+                continue
+            cap_json = figure_caption_tool._run(
+                image_path=fig_path,
+                hint=f"Figure from {os.path.basename(path)}",
+            )
+            try:
+                cap = json.loads(cap_json)
+            except Exception:
+                cap = {"raw": cap_json}
+            captions.append(
+                f"\n## {os.path.basename(path)} — {os.path.basename(fig_path)}\n\n"
+                f"```json\n{json.dumps(cap, indent=2)}\n```\n"
+            )
+            if doc_store is not None and session_id:
+                try:
+                    doc_store.add_document(
+                        text=json.dumps(cap),
+                        source=f"figure_caption:{fig_path}",
+                        title=f"Figure from {os.path.basename(path)}",
+                        doc_type="figure_caption",
+                        session_id=session_id,
+                    )
+                except Exception:
+                    pass
+    return "\n".join(captions)
+
+
 # Step 4: Web Research to Fill Gaps
 def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str = ""):
     """Conduct web searches to fill identified gaps."""
@@ -1217,23 +1422,56 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
     web_researcher_agent = Agent(
         role="Web Research Specialist",
         goal=(
-            "Find and synthesise information from PubMed, the open web, and the "
-            "user's own uploaded documents to fill research gaps, with explicit "
-            "citations. If a backend is unavailable, synthesise available information "
-            "and note what could not be verified."
+            "Find and synthesise information from PubMed, OpenAlex, Google "
+            "Scholar, the open web, and the user's own uploaded documents to "
+            "fill research gaps, with explicit citations. If a backend is "
+            "unavailable, synthesise available information and note what could "
+            "not be verified."
         ),
         backstory=(
-            "You are skilled at searching PubMed and the open web and at pulling "
-            "relevant passages from the user's own materials. You always cite "
-            "PMIDs for biomedical claims, prefer recent primary sources, and "
-            "document any gaps you could not fill."
+            "You are skilled at searching PubMed, OpenAlex, Google Scholar, "
+            "and the open web, at fetching the full text of a known URL, and "
+            "at pulling relevant passages from the user's own materials. You "
+            "always cite PMIDs for biomedical claims, prefer recent primary "
+            "sources, and document any gaps you could not fill. When a source "
+            "is referenced, you can resolve it to a structured citation. When "
+            "the topic is biomedical, you can also pull structured records "
+            "from NCBI (genes, proteins, variants), BLAST sequences against "
+            "public databases, fetch PDB/AlphaFold structures, and look up "
+            "antibody therapeutic metadata."
         ),
         llm=llm_string,
-        tools=[search_tool, pubmed_search_tool, local_kb_tool],   # H1 + M6 added
+        tools=[
+            search_tool,                # web_search        (existing)
+            pubmed_search_tool,         # pubmed_search     (H1)
+            openalex_tool,              # openalex          (M5)
+            google_scholar_tool,        # google_scholar    (H2)
+            local_kb_tool,              # local_kb          (M6)
+            url_fetch_tool,             # fetch_url         (M4)
+            citation_resolver_tool,     # resolve_citation  (M3)
+            ncbi_genomics_tool,         # ncbi_genomics     (H4) — bio
+            sequence_alignment_tool,    # sequence_align    (M1) — bio
+            structure_lookup_tool,      # structure_lookup  (M2) — bio
+            antibody_therapeutic_tool,  # antibody_therapeutic (H5) — bio
+        ],
         verbose=True,
         allow_delegation=False,
-        max_iter=10,
+        max_iter=15,
     )
+
+    # Pull the Stage 2b/2c results into the agent's context when present.
+    bio_block = ""
+    if st.session_state.get("bio_curation"):
+        bio_block = (
+            "\n\nBio Curation (Stage 2b) — structured records already pulled:\n"
+            + (st.session_state.bio_curation or "")[:4000]
+        )
+    fig_block = ""
+    if st.session_state.get("figure_reading"):
+        fig_block = (
+            "\n\nFigure Reading (Stage 2c) — captions from uploaded PDFs:\n"
+            + (st.session_state.figure_reading or "")[:2000]
+        )
 
     web_research_task = Task(
         description=f"""
@@ -1241,6 +1479,8 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
         {gap_analysis}
         {context}
         {resources}
+        {bio_block}
+        {fig_block}
 
         For each gap, work through the following decision tree:
 
@@ -1254,8 +1494,21 @@ def step4_web_research(gap_analysis: str, llm, context: str = "", resources: str
            reference, call `pubmed_search` again with mode='fetch' and that
            PMID for the full structured record. Cite PMIDs as [PMID: 12345678]
            inline.
-        3. For non-biomedical angles or very recent preprints, fall back to
+        3. For cross-disciplinary, open-access, or citation-count needs, call
+           `openalex` with a free-text query. It returns OA status, concepts,
+           and citation counts; cite OpenAlex IDs as [OpenAlex: W...] inline.
+        4. For non-biomedical papers, theses, or preprints where you need
+           citation counts, call `google_scholar`. Scholar is captcha-prone
+           under the default Selenium backend, so prefer `openalex` when
+           both would work; only use Scholar when you specifically need its
+           citation graph. Cite as [Scholar: <title>] inline.
+        5. If you have a specific URL from a previous search snippet and need
+           the full page text, call `fetch_url`. Cite as [URL: <url>] inline.
+        6. For non-biomedical angles or very recent preprints, fall back to
            `web_search`.
+        7. When you have a DOI/PMID/arXiv ID/ISBN you want to format as a
+           citation, call `resolve_citation` to get a structured record. The
+           Writer stage will use this for the bibliography.
 
         Always cite the source you actually used — do not invent PMIDs or URLs.
 
@@ -1453,6 +1706,70 @@ def _markdown_to_docx(markdown_text: str, title: str = "Research Output") -> byt
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Bibliography extraction + export
+# ---------------------------------------------------------------------------
+# The Web Researcher is instructed to cite sources inline as:
+#   [PMID: 12345678]                 → PubMed
+#   [OpenAlex: W...]                 → OpenAlex
+#   [DOI: 10.1038/nature12373]       → DOI
+#   [arXiv: 2301.00001]              → arXiv preprint
+#   [URL: https://...]               → generic web reference
+#   [Source: <title>]                → user-uploaded document
+#
+# `_extract_identifiers` scans the final written output for these tokens
+# and returns a deduplicated, ordered list of strings that
+# `reference_manager_tool` can resolve into BibTeX / RIS entries.
+
+import re as _re
+
+_BIBTEX_PATTERNS = [
+    # DOI: 10.xxxx/yyyy  (with optional prefix; case-insensitive)
+    _re.compile(r"\b(?:DOI:?\s*|https?://(?:dx\.)?doi\.org/)(10\.\d{4,9}/[^\s\]\)\,]+)", _re.IGNORECASE),
+    # PMID: bare 6-9 digit run prefixed by "PMID:"
+    _re.compile(r"\bPMID:?\s*(\d{6,9})\b", _re.IGNORECASE),
+    # arXiv: 1234.5678 (with optional vN suffix) or older cs.AI/0102034
+    _re.compile(r"\barXiv:?\s*([a-z\-]+(?:\.[A-Z]{2})?/\d{7}|\d{4}\.\d{4,5}(?:v\d+)?)\b", _re.IGNORECASE),
+]
+
+
+def _extract_identifiers(markdown_text: str) -> list[str]:
+    """Pull DOIs, PMIDs, and arXiv IDs out of a markdown document.
+
+    Returns a list in the order they first appear, deduplicated.  OpenAlex
+    IDs and bare URLs are intentionally NOT included — OpenAlex is metadata
+    not a primary identifier, and URL-only refs cannot be reliably resolved
+    to a structured citation without a DOI/PMID/arXiv inside them.
+    """
+    seen: dict[str, None] = {}
+    for pat in _BIBTEX_PATTERNS:
+        for m in pat.finditer(markdown_text):
+            ident = m.group(1).rstrip(".,;)")
+            if ident and ident not in seen:
+                seen[ident] = None
+    return list(seen.keys())
+
+
+def _build_bibliography(markdown_text: str, fmt: str) -> tuple[str, int]:
+    """Resolve identifiers from *markdown_text* and return a (text, count) pair.
+
+    *fmt* is 'bibtex' or 'ris'. On any error or empty list, returns
+    ('', 0) so the UI can show a helpful empty-state message.
+    """
+    try:
+        ids = _extract_identifiers(markdown_text)
+    except Exception:
+        return ("", 0)
+    if not ids:
+        return ("", 0)
+    try:
+        text = reference_manager_tool._run(ids, format=fmt, resolve=True)
+        # The tool returns plain text for bibtex/ris (not JSON).
+        return (text or "", len(ids))
+    except Exception:
+        return ("", 0)
 
 
 # Step 5: Write Output (format-aware, length-aware, dual-path writer)
@@ -2028,6 +2345,31 @@ def main() -> None:
 
         st.divider()
 
+        # Biomedical mode toggle — when on, a Stage 2b "Bio Curation" sub-pipeline
+        # runs between Gap Analysis and Web Research, with access to NCBI
+        # genomics, BLAST, structure lookup, antibody, and clinical-trials tools.
+        st.session_state.biomedical_mode = st.checkbox(
+            "🧬 Enable biomedical mode (Stage 2b: Bio Curation)",
+            value=st.session_state.biomedical_mode,
+            help=(
+                "Adds a dedicated Bio Curation step with NCBI gene/protein/variant "
+                "lookup, BLAST sequence alignment, PDB/AlphaFold structure retrieval, "
+                "and antibody therapeutic aggregation. Recommended for genomics, "
+                "antibody, and clinical-research topics. Skipped for non-biomedical topics."
+            ),
+        )
+        st.session_state.multimodal_mode = st.checkbox(
+            "🖼️ Enable figure reading (Stage 2c: figure captioning for uploaded PDFs)",
+            value=st.session_state.multimodal_mode,
+            help=(
+                "If you've uploaded PDFs, this adds a Figure Reading step that "
+                "extracts and captions each figure using a local vision model. "
+                "Requires Ollama with a vision model (e.g. llama3.2-vision)."
+            ),
+        )
+
+        st.divider()
+
         if st.session_state.context_configured:
             st.info(
                 f"**Current context:** Perspective: *{st.session_state.perspective}* | "
@@ -2138,12 +2480,89 @@ def main() -> None:
 
         col1, col2 = st.columns(2)
         with col1:
+            # Route through 2b/2c when their toggles are on, otherwise
+            # jump straight to Web Research. The next branch in main()
+            # handles 2b/2c and routes to 3 when done.
             if st.button("✅ Proceed to Web Research", type="primary"):
-                st.session_state.workflow_stage = 3
+                if st.session_state.biomedical_mode:
+                    st.session_state.workflow_stage = 21
+                elif st.session_state.multimodal_mode:
+                    st.session_state.workflow_stage = 22
+                else:
+                    st.session_state.workflow_stage = 3
                 st.rerun()
         with col2:
             if st.button("🔄 Redo Gap Analysis"):
                 st.session_state.gap_analysis = None
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # Stage 2b -- Bio Curation (skipped unless biomedical_mode is on)
+    # ------------------------------------------------------------------
+    elif st.session_state.workflow_stage == 21:
+        st.header("Step 3b: Bio Curation")
+        if not st.session_state.biomedical_mode:
+            st.info("Biomedical mode is off; jumping to Web Research.")
+            st.session_state.workflow_stage = (
+                22 if st.session_state.multimodal_mode else 3
+            )
+            st.rerun()
+
+        context = build_context_block()
+        resources = _resources_for(
+            f"biomedical entities relevant to {st.session_state.user_input}"
+        )
+        if st.session_state.bio_curation is None:
+            st.session_state.bio_curation = step2b_bio_curation(
+                st.session_state.research_plan or "",
+                st.session_state.initial_research or "",
+                st.session_state.gap_analysis or "",
+                llm,
+                context=context,
+                resources=resources,
+            )
+        st.text_area("Bio Curation", st.session_state.bio_curation, height=400)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Proceed", type="primary"):
+                st.session_state.workflow_stage = (
+                    22 if st.session_state.multimodal_mode else 3
+                )
+                st.rerun()
+        with col2:
+            if st.button("🔄 Redo Bio Curation"):
+                st.session_state.bio_curation = None
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # Stage 2c -- Figure Reading (skipped unless multimodal_mode is on)
+    # ------------------------------------------------------------------
+    elif st.session_state.workflow_stage == 22:
+        st.header("Step 3c: Figure Reading")
+        if not st.session_state.multimodal_mode:
+            st.session_state.workflow_stage = 3
+            st.rerun()
+        # Pull doc_store + session_id from the sidebar-rendered state.
+        doc_store = _get_document_store(
+            st.session_state.get("embed_model", "nomic-embed-text")
+        )
+        sid = st.session_state.get("session_id", "")
+        if st.session_state.figure_reading is None:
+            st.session_state.figure_reading = step2c_figure_reading(
+                st.session_state.research_plan or "",
+                llm,
+                doc_store=doc_store,
+                session_id=sid,
+            )
+        st.text_area("Figure Reading", st.session_state.figure_reading, height=400)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Proceed to Web Research", type="primary"):
+                st.session_state.workflow_stage = 3
+                st.rerun()
+        with col2:
+            if st.button("🔄 Redo Figure Reading"):
+                st.session_state.figure_reading = None
                 st.rerun()
 
     # ------------------------------------------------------------------
@@ -2312,7 +2731,16 @@ def main() -> None:
         # Generate DOCX bytes deterministically (no LLM needed)
         docx_bytes = _markdown_to_docx(st.session_state.written_output, title=fmt_label)
 
-        col1, col2, col3 = st.columns(3)
+        # Pull identifiers from the output and build bibliography strings
+        # once so the two bibliography buttons can reuse them.
+        bibtex_text, bibtex_n = _build_bibliography(
+            st.session_state.written_output, "bibtex"
+        )
+        ris_text, ris_n = _build_bibliography(
+            st.session_state.written_output, "ris"
+        )
+
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.download_button(
                 "📥 Download DOCX",
@@ -2329,6 +2757,34 @@ def main() -> None:
                 mime="text/markdown",
             )
         with col3:
+            # BibTeX download — disabled when no identifiers were extracted.
+            st.download_button(
+                "📚 Bibliography (.bib)",
+                bibtex_text or "# No DOIs, PMIDs, or arXiv IDs found in the document.",
+                file_name=f"{safe_fmt}_{timestamp}.bib",
+                mime="application/x-bibtex",
+                disabled=not bibtex_text,
+                help=(
+                    f"Resolves {bibtex_n} identifier(s) found in the document via "
+                    "Crossref / NCBI E-utilities / arXiv / Google Books."
+                    if bibtex_n else
+                    "No resolvable identifiers were found in the document."
+                ),
+            )
+        with col4:
+            st.download_button(
+                "📚 Bibliography (.ris)",
+                ris_text or "# No DOIs, PMIDs, or arXiv IDs found in the document.",
+                file_name=f"{safe_fmt}_{timestamp}.ris",
+                mime="application/x-research-info-systems",
+                disabled=not ris_text,
+                help=(
+                    f"Resolves {ris_n} identifier(s) found in the document."
+                    if ris_n else
+                    "No resolvable identifiers were found in the document."
+                ),
+            )
+        with col5:
             if st.button("🔄 Redo Output"):
                 st.session_state.written_output = None
                 st.session_state.blog_post = None

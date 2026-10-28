@@ -50,6 +50,9 @@ Thumbs.db
 # ChromaDB persistent store
 chroma_db/
 
+# Downloaded structure files (PDB/AlphaFold)
+structures/
+
 # Logs
 *.log
 logs/
