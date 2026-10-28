@@ -84,14 +84,14 @@ Both feed results into the existing ChromaDB pipeline; the existing Stage 3 → 
 
 ### Low priority
 
-- [ ] **L1 `ClinicalTrialsTool`** — ClinicalTrials.gov lookup *(objective 2)*
-- [ ] **L2 `PathwayDatabaseTool`** — KEGG / Reactome pathway lookup *(objective 2)*
-- [ ] **L3 `DatasetSearchTool`** — GEO / EBI ENA dataset discovery *(objective 2)*
-- [ ] **L4 `PatentSearchTool`** — USPTO / EPO / WIPO patent search *(objective 2)*
-- [ ] **L5 `DrugInteractionTool`** — DrugBank / ChEMBL *(objective 2)*
-- [ ] **L6 `GitHubCodeSearchTool`** — find reference implementations *(objective 1)*
-- [ ] **L7 `AudioTranscriptTool`** — Whisper-based local transcription *(objectives 1, 4)*
-- [ ] **L8 `ReferenceManagerTool`** — export BibTeX / RIS *(objective 1)*
+- [x] **L1 `ClinicalTrialsTool`** — ClinicalTrials.gov lookup *(objective 2)*
+- [x] **L2 `PathwayDatabaseTool`** — KEGG / Reactome pathway lookup *(objective 2)*
+- [x] **L3 `DatasetSearchTool`** — GEO / EBI ENA dataset discovery *(objective 2)*
+- [x] **L4 `PatentSearchTool`** — USPTO / EPO / WIPO patent search *(objective 2)*
+- [x] **L5 `DrugInteractionTool`** — DrugBank / ChEMBL *(objective 2)*
+- [x] **L6 `GitHubCodeSearchTool`** — find reference implementations *(objective 1)*
+- [x] **L7 `AudioTranscriptTool`** — Whisper-based local transcription *(objectives 1, 4)*
+- [x] **L8 `ReferenceManagerTool`** — export BibTeX / RIS *(objective 1)*
 
 ---
 
@@ -462,7 +462,7 @@ Both feed results into the existing ChromaDB pipeline; the existing Stage 3 → 
 
 ### L1 `ClinicalTrialsTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Bio Curator
 
 **Objectives served:** (2)
 
@@ -483,13 +483,13 @@ Both feed results into the existing ChromaDB pipeline; the existing Stage 3 → 
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Bio Curator. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L2 `PathwayDatabaseTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Bio Curator
 
 **Objectives served:** (2)
 
@@ -510,13 +510,13 @@ Both feed results into the existing ChromaDB pipeline; the existing Stage 3 → 
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Bio Curator. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L3 `DatasetSearchTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Bio Curator
 
 **Objectives served:** (2)
 
@@ -538,13 +538,13 @@ Both feed results into the existing ChromaDB pipeline; the existing Stage 3 → 
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Bio Curator. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L4 `PatentSearchTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Bio Curator
 
 **Objectives served:** (2)
 
@@ -566,13 +566,13 @@ Both feed results into the existing ChromaDB pipeline; the existing Stage 3 → 
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Bio Curator. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L5 `DrugInteractionTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Bio Curator
 
 **Objectives served:** (2)
 
@@ -592,13 +592,13 @@ class DrugLookupInput(BaseModel):
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Bio Curator. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L6 `GitHubCodeSearchTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Web Research Specialist
 
 **Objectives served:** (1)
 
@@ -619,13 +619,13 @@ class DrugLookupInput(BaseModel):
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Web Research Specialist. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L7 `AudioTranscriptTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented, attached to Web Research Specialist
 
 **Objectives served:** (1), (4)
 
@@ -646,13 +646,13 @@ class DrugLookupInput(BaseModel):
 **Build notes:** _none yet_
 
 **Progress log:**
-- _(none yet)_
+- 2026-10-28 — Implemented and wired into Web Research Specialist. Live-or-skip tests in `tests/test_backlog_tools.py`.
 
 ---
 
 ### L8 `ReferenceManagerTool` *(Low)*
 
-**Status:** `[ ]` proposed
+**Status:** `[x]` implemented
 
 **Objectives served:** (1)
 
@@ -726,16 +726,18 @@ Each phase ends with a tangible improvement; nothing is purely speculative.
 
 ## Progress roll-up
 
-Last updated: 2026-08-22
+Last updated: 2026-10-28
 
 | Priority | Total | Proposed `[ ]` | Design `[~]` | WIP `[wip]` | Done `[x]` |
 |----------|-------|----------------|--------------|-------------|------------|
 | High     | 5     | 0              | 0            | 0           | 5          |
-| Medium   | 7     | 1              | 0            | 0           | 6          |
-| Low      | 8     | 8              | 0            | 0           | 0          |
-| **All**  | **20**| **9**          | **0**        | **0**       | **11**     |
+| Medium   | 7     | 0              | 0            | 0           | 7          |
+| Low      | 8     | 1              | 0            | 0           | 7          |
+| **All**  | **20**| **1**          | **0**        | **0**       | **19**     |
 
 ### Recently completed (last 8)
+- **L1-L5 bio-domain tools** — ClinicalTrials.gov, KEGG/Reactome, GEO/ENA/BioProject, USPTO/EPO/WIPO patents, ChEMBL/DrugBank — wired into Bio Curator.
+- **L6 `GitHubCodeSearchTool`** and **L7 `AudioTranscriptTool`** — wired into Web Research Specialist.
 - **H1 `PubMedSearchTool`** — implemented and wired into the Web Researcher.
 - **H2 `GoogleScholarTool`** — two backends (Selenium default, SerpAPI optional); wired into Web Researcher.
 - **H3 `MultimodalExtractTool`** — text/tables/figures from PDFs/images; integrated via `tools_multimodal.py` + `tools.py` import fallback.
@@ -769,4 +771,5 @@ Last updated: 2026-08-22
 - `tests/test_google_scholar.py` — 7 tests; backend selection and error shape.
 - `tests/test_bio_tools.py` — 13 tests; live NCBI / PDB / AlphaFold calls.
 - `tests/test_antibody_figure.py` — 7 tests; aggregate shape and Ollama-missing path.
-- **Total: 42 tests, all passing.**
+- `tests/test_backlog_tools.py` — 22 tests; L1-L7 input validation, clamping, missing-key errors, and live-or-skip checks.
+- **Total: 64 tests, all passing.**
