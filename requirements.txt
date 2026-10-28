@@ -53,3 +53,6 @@ tiktoken>=0.5.0
 
 # For JSON handling
 jsonschema>=4.17.0
+
+# Optional — enables AudioTranscriptTool (L7); not required for the rest of the app
+# faster-whisper>=1.0.0

@@ -3112,3 +3112,98 @@ class GitHubCodeSearchTool(BaseTool):
 
 
 github_code_search_tool = GitHubCodeSearchTool()
+
+# ===========================================================================
+# L7 — AudioTranscriptTool
+# ===========================================================================
+# Local transcription via faster-whisper. Imported lazily inside _run so
+# tools.py keeps importing cleanly when the (optional, not-in-requirements)
+# package isn't installed — degrades to a JSON {"error": ...} instead of
+# an ImportError at module load time.
+
+AUDIO_HTTP_TIMEOUT: int = 60
+_whisper_model_cache: dict[str, Any] = {}
+
+
+class AudioTranscriptInput(BaseModel):
+    """Inputs for AudioTranscriptTool."""
+
+    source: str = Field(..., description="Local audio file path or a direct audio URL (mp3/wav/m4a).")
+    language: Optional[str] = Field(None, description="Optional ISO-639-1 language hint, e.g. 'en'.")
+
+
+def _resolve_audio_source(source: str) -> str:
+    """Return a local file path for *source*, downloading it first if it's a URL."""
+    if source.startswith("http://") or source.startswith("https://"):
+        import tempfile
+        resp = requests.get(source, timeout=AUDIO_HTTP_TIMEOUT, stream=True)
+        resp.raise_for_status()
+        suffix = os.path.splitext(source.split("?")[0])[-1] or ".mp3"
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        with os.fdopen(fd, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=65536):
+                fh.write(chunk)
+        return path
+    if not os.path.isfile(source):
+        raise FileNotFoundError(f"audio file not found: {source}")
+    return source
+
+
+def _get_whisper_model():
+    """Process-local cache for the faster-whisper model (loading it is expensive)."""
+    from faster_whisper import WhisperModel
+    cached = _whisper_model_cache.get("base")
+    if cached is not None:
+        return cached
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    _whisper_model_cache["base"] = model
+    return model
+
+
+class AudioTranscriptTool(BaseTool):
+    """Transcribe an audio file or URL into text using a local Whisper model."""
+
+    name: str = "transcribe_audio"
+    description: str = (
+        "Transcribe an audio file (local path) or audio URL into text using a local "
+        "Whisper model (faster-whisper). Returns the transcript with per-segment "
+        "timestamps. Use for podcasts, lectures, or recorded talks. Requires the "
+        "faster-whisper package to be installed."
+    )
+    args_schema: type[BaseModel] = AudioTranscriptInput
+
+    def _run(self, source: str, language: Optional[str] = None) -> str:
+        if not source or not source.strip():
+            return json.dumps({"error": "empty source"})
+        try:
+            from faster_whisper import WhisperModel  # noqa: F401
+        except ImportError:
+            return json.dumps({
+                "error": "faster-whisper is not installed. Install it with "
+                         "'pip install faster-whisper' to enable audio transcription."
+            })
+
+        try:
+            path = _resolve_audio_source(source.strip())
+            model = _get_whisper_model()
+            segments, info = model.transcribe(path, language=language)
+            seg_list = [
+                {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+                for s in segments
+            ]
+            transcript = " ".join(s["text"] for s in seg_list)
+            return json.dumps({
+                "source": source,
+                "language": info.language,
+                "transcript": transcript,
+                "segments": seg_list,
+            }, indent=2)
+        except requests.RequestException as exc:
+            logger.warning("AudioTranscript network error: %s", exc)
+            return json.dumps({"error": f"AudioTranscript network error: {exc}"})
+        except Exception as exc:
+            logger.warning("AudioTranscript tool failed: %s", exc)
+            return json.dumps({"error": f"AudioTranscript tool failed: {exc}"})
+
+
+audio_transcript_tool = AudioTranscriptTool()

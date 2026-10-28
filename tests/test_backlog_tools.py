@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import (  # noqa: E402
     clinical_trials_tool, pathway_lookup_tool, dataset_search_tool,
     patent_search_tool, drug_interaction_tool, github_code_search_tool,
+    audio_transcript_tool,
 )
 
 
@@ -164,3 +165,18 @@ def test_github_search_live_or_skip():
     assert isinstance(parsed, (list, dict))
     if isinstance(parsed, list) and parsed:
         assert "url" in parsed[0]
+
+
+def test_audio_transcript_empty_source():
+    out = audio_transcript_tool._run("")
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_audio_transcript_missing_dependency_or_bad_path():
+    """Deterministic without network or faster-whisper installed: either the
+    'faster-whisper not installed' branch or the 'file not found' branch
+    fires, and both are JSON errors, not exceptions."""
+    out = audio_transcript_tool._run("/nonexistent/path/to/audio.mp3")
+    parsed = json.loads(out)
+    assert "error" in parsed
