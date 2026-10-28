@@ -3132,8 +3132,13 @@ class AudioTranscriptInput(BaseModel):
     language: Optional[str] = Field(None, description="Optional ISO-639-1 language hint, e.g. 'en'.")
 
 
-def _resolve_audio_source(source: str) -> str:
-    """Return a local file path for *source*, downloading it first if it's a URL."""
+def _resolve_audio_source(source: str) -> tuple[str, bool]:
+    """Return a local file path for *source* and a boolean indicating if it's a temp file.
+
+    If source is a URL, downloads it to a temp file and returns (path, True).
+    If source is a local file, returns (path, False).
+    Downloads are the caller's responsibility to clean up.
+    """
     if source.startswith("http://") or source.startswith("https://"):
         import tempfile
         resp = requests.get(source, timeout=AUDIO_HTTP_TIMEOUT, stream=True)
@@ -3143,10 +3148,10 @@ def _resolve_audio_source(source: str) -> str:
         with os.fdopen(fd, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=65536):
                 fh.write(chunk)
-        return path
+        return path, True
     if not os.path.isfile(source):
         raise FileNotFoundError(f"audio file not found: {source}")
-    return source
+    return source, False
 
 
 def _get_whisper_model():
@@ -3183,8 +3188,10 @@ class AudioTranscriptTool(BaseTool):
                          "'pip install faster-whisper' to enable audio transcription."
             })
 
+        path = None
+        is_temp = False
         try:
-            path = _resolve_audio_source(source.strip())
+            path, is_temp = _resolve_audio_source(source.strip())
             model = _get_whisper_model()
             segments, info = model.transcribe(path, language=language)
             seg_list = [
@@ -3204,6 +3211,13 @@ class AudioTranscriptTool(BaseTool):
         except Exception as exc:
             logger.warning("AudioTranscript tool failed: %s", exc)
             return json.dumps({"error": f"AudioTranscript tool failed: {exc}"})
+        finally:
+            # Clean up downloaded temp files, but not local files the user provided.
+            if is_temp and path:
+                try:
+                    os.remove(path)
+                except Exception as cleanup_exc:
+                    logger.warning("Failed to clean up temp audio file %s: %s", path, cleanup_exc)
 
 
 audio_transcript_tool = AudioTranscriptTool()
