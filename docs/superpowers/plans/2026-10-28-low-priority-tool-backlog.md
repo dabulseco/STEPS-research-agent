@@ -1553,7 +1553,6 @@ git commit -m "app: wire L1-L7 tools into Bio Curator and Web Research Specialis
 
 **Files:**
 - Modify: `app_roadmap.md` (mark L1-L7 as `[x]`, update progress roll-up table and "Recently completed" list)
-- Modify: `app_status_20260815.md` (bump the tool-harness line in the "Status Snapshot" section, or leave a note that it is superseded by `app_roadmap.md` — the roadmap is the living doc; the status file is a point-in-time snapshot from 2026-08-15 and is not meant to be kept current)
 
 **Interfaces:**
 - Consumes: nothing (documentation only).
