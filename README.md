@@ -1,6 +1,6 @@
-# AI Research Agent v3
+# AI Research Agent
 
-A local, privacy-first autonomous research agent that plans, investigates, and writes long-form documents — all running on your machine with no cloud API required.
+A local, privacy-first autonomous research agent that plans, investigates, and writes long-form documents — running locally on your machine by default, with optional Ollama Cloud models.
 
 Built with [CrewAI](https://github.com/crewAIInc/crewAI), [Ollama](https://ollama.ai), [ChromaDB](https://www.trychroma.com), and [Streamlit](https://streamlit.io).
 
@@ -9,7 +9,7 @@ Built with [CrewAI](https://github.com/crewAIInc/crewAI), [Ollama](https://ollam
 ## Features
 
 - **Multi-stage research pipeline** — automated planning, initial research, gap analysis, web search, and writing with human review checkpoints at each stage
-- **Fully local** — all LLM inference runs via Ollama; no OpenAI or cloud API keys required
+- **Local-first** — LLM inference runs via Ollama on your machine; no OpenAI keys required. Optionally set `OLLAMA_API_KEY` (see `.env.example`) to add Ollama Cloud models to the model picker
 - **Semantic RAG** — documents are chunked, embedded, and stored in ChromaDB; retrieval is query-aware rather than relying on fixed truncation
 - **Per-section retrieval** — for long documents (5,000+ words), each section receives the most relevant research context rather than a compressed summary of everything
 - **Web search reranking** — search results are reordered by embedding similarity to the query before being passed to the agent
@@ -36,7 +36,7 @@ Built with [CrewAI](https://github.com/crewAIInc/crewAI), [Ollama](https://ollam
 ```bash
 # 1. Clone the repository
 git clone <repo-url>
-cd research_agent_v3
+cd research_agentV4
 
 # 2. Create and activate a virtual environment
 python3 -m venv .venv
@@ -73,7 +73,7 @@ Any model installed in Ollama will appear in the model selector. The embedding m
 ## Project Structure
 
 ```
-research_agent_v3/
+research_agentV4/
 ├── app.py              # Main Streamlit application
 ├── rag.py              # ChromaDB DocumentStore — chunking, embedding, retrieval
 ├── requirements.txt    # Python dependencies
