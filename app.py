@@ -793,7 +793,9 @@ def build_agent_llm(model_name: str):
     """
     if st.session_state.get("is_cloud_model"):
         return LLM(
-            model=f"ollama/{model_name}",
+            # ollama_chat/ hits /api/chat, which passes tool schemas natively;
+            # plain ollama/ uses /api/generate and the model emits <tool_call> text.
+            model=f"ollama_chat/{model_name}",
             base_url=OLLAMA_CLOUD_BASE_URL,
             api_key=OLLAMA_API_KEY,
         )
