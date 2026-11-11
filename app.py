@@ -26,6 +26,8 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 import streamlit as st
 from rag import DocumentStore, classify_embedding_models
 from tools import (
+    ollama_web_search,
+    search_with_fallback,
     local_kb_tool,
     pubmed_search_tool,
     citation_resolver_tool,
@@ -98,7 +100,9 @@ if 'user_input' not in st.session_state:
 if 'browser_type' not in st.session_state:
     st.session_state.browser_type = "chrome"
 if 'search_method' not in st.session_state:
-    st.session_state.search_method = "selenium"
+    # Ollama's hosted search is the default when a key is configured;
+    # otherwise start on DuckDuckGo (fast, no browser needed).
+    st.session_state.search_method = "ollama" if OLLAMA_API_KEY else "duckduckgo"
 
 # Research context configuration
 if 'perspective' not in st.session_state:
@@ -999,13 +1003,24 @@ class WebSearchTool(BaseTool):
     
     def _run(self, query: str) -> str:
         """Search the web using selected method, then rerank by relevance."""
-        search_method = st.session_state.get('search_method', 'selenium')
+        default_method = 'ollama' if OLLAMA_API_KEY else 'duckduckgo'
+        search_method = st.session_state.get('search_method', default_method)
         browser_type = st.session_state.get('browser_type', 'chrome')
 
-        if search_method == 'selenium':
-            raw = self._selenium_search(query, browser_type)
-        else:
-            raw = self._ddg_search(query)
+        available = {
+            'ollama': lambda q: ollama_web_search(q, OLLAMA_API_KEY, OLLAMA_CLOUD_BASE_URL),
+            'duckduckgo': self._ddg_search,
+            'selenium': lambda q: self._selenium_search(q, browser_type),
+        }
+        if not OLLAMA_API_KEY:
+            available.pop('ollama')
+
+        # Selected method first, then the rest as fall-backs
+        # (Ollama -> DuckDuckGo -> Selenium; fastest/cheapest first).
+        order = [search_method] if search_method in available else []
+        order += [m for m in ('ollama', 'duckduckgo', 'selenium')
+                  if m in available and m not in order]
+        raw = search_with_fallback(query, [(m, available[m]) for m in order])
 
         # Rerank results by embedding similarity when RAG is enabled
         if st.session_state.get('rag_enabled', True):
@@ -2318,16 +2333,29 @@ def main() -> None:
         st.session_state.enable_web_search = enable_web_search
 
         if enable_web_search:
+            method_options = (
+                ["ollama", "duckduckgo", "selenium"] if OLLAMA_API_KEY
+                else ["duckduckgo", "selenium"]
+            )
+            method_labels = {
+                "ollama": "☁️ Ollama Web Search (API key)",
+                "duckduckgo": "🦆 DuckDuckGo API",
+                "selenium": "🌐 Selenium (Headless Browser)",
+            }
             search_method: str = st.radio(
                 "Search Method",
-                options=["selenium", "duckduckgo"],
-                format_func=lambda x: (
-                    "🌐 Selenium (Headless Browser)"
-                    if x == "selenium"
-                    else "🦆 DuckDuckGo API"
+                options=method_options,
+                format_func=lambda x: method_labels[x],
+                help=(
+                    "The selected method is tried first; if it fails or returns "
+                    "nothing, the others are tried automatically as fall-backs. "
+                    "Ollama search is fastest and most reliable but needs "
+                    "OLLAMA_API_KEY; DuckDuckGo may be rate-limited; Selenium "
+                    "is slowest."
                 ),
-                help="Selenium is more reliable but slower. DuckDuckGo is faster but may be rate-limited.",
             )
+            if not OLLAMA_API_KEY:
+                st.caption("Set `OLLAMA_API_KEY` in `.env` to enable Ollama Web Search (the default).")
             st.session_state.search_method = search_method
 
             if search_method == "selenium":
@@ -2352,6 +2380,8 @@ def main() -> None:
                             st.info("🍎 **MacOS Intel** — Both browsers should work well")
                     case _:
                         st.info(f"💡 Using {browser_type.capitalize()} in headless mode")
+            elif search_method == "ollama":
+                st.info("💡 Using Ollama Web Search (falls back to DuckDuckGo, then Selenium)")
             else:
                 st.info("💡 Using DuckDuckGo API (may be rate-limited)")
         else:

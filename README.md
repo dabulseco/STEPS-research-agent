@@ -27,7 +27,8 @@ Built with [CrewAI](https://github.com/crewAIInc/crewAI), [Ollama](https://ollam
 - At least one Ollama language model (e.g. `llama3.2`, `gemma3:27b`)
 - `nomic-embed-text` recommended for embeddings (see setup below)
 - Python 3.11+
-- Chrome or Firefox for Selenium-based web search (optional)
+- Chrome or Firefox for Selenium-based web search (optional fall-back)
+- `OLLAMA_API_KEY` in `.env` for Ollama Web Search, the default search method (optional; see `.env.example`)
 
 ---
 
@@ -95,7 +96,7 @@ All settings are available in the sidebar:
 | Embedding model | `nomic-embed-text` | Model used to generate document embeddings |
 | Writer context window | 32,768 tokens | Token budget for the writer agent (8K–64K) |
 | Enable web search | On | Allow the agent to search the web during gap-filling |
-| Search method | Selenium | Headless browser (more reliable) or DuckDuckGo API |
+| Search method | Ollama (if `OLLAMA_API_KEY` set), else DuckDuckGo | Ollama Web Search API, DuckDuckGo API, or headless Selenium. The selected method is tried first; the others are automatic fall-backs |
 
 ---
 

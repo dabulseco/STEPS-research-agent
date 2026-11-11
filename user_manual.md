@@ -115,7 +115,7 @@ Controls the token budget available to the writer agent. Larger values allow the
 ### Web Search Settings
 
 - **Enable Web Search** — uncheck to skip web research entirely and rely only on the model's training knowledge.
-- **Search Method** — choose between Selenium (headless browser, more reliable) and DuckDuckGo API (faster, may be rate-limited).
+- **Search Method** — choose Ollama Web Search (default when `OLLAMA_API_KEY` is set in `.env`), DuckDuckGo API (fast, may be rate-limited), or Selenium (headless browser, slowest). The method you select is tried first; if it fails or returns nothing, the others are tried automatically as fall-backs (Ollama → DuckDuckGo → Selenium).
 - **Browser** — Chrome or Firefox for Selenium. On Apple Silicon Macs, Firefox is recommended if Chrome encounters issues.
 
 ---
@@ -350,9 +350,17 @@ Uncheck **Enable semantic RAG** in the sidebar to fall back to the original beha
 
 ## Web Search Settings
 
+### Ollama Web Search (default)
+
+Uses Ollama's hosted search API with your `OLLAMA_API_KEY` (set it in `.env`; see `.env.example`). Fast and needs no browser. If the key is not set, this option is hidden and DuckDuckGo is the default.
+
+### Fall-back behaviour
+
+The method you select is tried first. If it errors or returns no results, the remaining methods are tried automatically in the order Ollama → DuckDuckGo → Selenium.
+
 ### Selenium (Headless Browser)
 
-The default and most reliable method. Launches Chrome or Firefox in headless mode, navigates to Google (with Bing as a fallback), and extracts titles, URLs, and snippets from search results.
+The slowest method, but independent of any API. Launches Chrome or Firefox in headless mode, navigates to Google (with Bing as a fallback), and extracts titles, URLs, and snippets from search results.
 
 **macOS Apple Silicon (M1/M2/M3):** Firefox is recommended over Chrome for compatibility. Install the ARM version of Chrome from [google.com/chrome](https://www.google.com/chrome/) if you prefer Chrome.
 

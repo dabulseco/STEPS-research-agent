@@ -3234,3 +3234,109 @@ class AudioTranscriptTool(BaseTool):
 
 
 audio_transcript_tool = AudioTranscriptTool()
+
+
+# ---------------------------------------------------------------------------
+# Web search: Ollama hosted search API + fallback chain
+# ---------------------------------------------------------------------------
+# `WebSearchTool` in app.py calls these.  They live here (not in app.py) so
+# they can be unit-tested without importing the whole Streamlit app.
+
+OLLAMA_SEARCH_PATH = "/api/web_search"
+OLLAMA_SEARCH_TIMEOUT = 20
+OLLAMA_SEARCH_MAX_RESULTS = 10  # API-side cap
+
+# Placeholder titles that the app's search backends return (instead of
+# raising) when they find nothing or fail.  Used to detect "this backend
+# did not really work, try the next one".
+_SEARCH_FAILURE_TITLES = {
+    "No results found",
+    "Search error",
+    "Search temporarily unavailable",
+}
+
+
+def ollama_web_search(
+    query: str,
+    api_key: str,
+    base_url: str = "https://ollama.com",
+    max_results: int = 5,
+) -> str:
+    """Search via Ollama's hosted web search API (POST /api/web_search).
+
+    Returns a JSON string: a list of ``{title, link, snippet}`` dicts, the
+    same shape the other web-search backends produce.  Raises
+    ``RuntimeError`` on a missing key, HTTP/network error, or malformed
+    response; the message never contains the API key.
+    """
+    if not api_key:
+        raise RuntimeError("OLLAMA_API_KEY is not set")
+    max_results = max(1, min(int(max_results), OLLAMA_SEARCH_MAX_RESULTS))
+    try:
+        resp = requests.post(
+            base_url.rstrip("/") + OLLAMA_SEARCH_PATH,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"query": query, "max_results": max_results},
+            timeout=OLLAMA_SEARCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        raise RuntimeError(f"Ollama web search returned HTTP {status}") from None
+    except (requests.RequestException, ValueError) as e:
+        raise RuntimeError(f"Ollama web search failed: {type(e).__name__}") from None
+
+    items = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("Ollama web search returned an unexpected response")
+    results = [
+        {
+            "title": it.get("title") or "No title",
+            "link": it.get("url") or "",
+            "snippet": it.get("content") or "No snippet available",
+        }
+        for it in items[:max_results]
+        if isinstance(it, dict)
+    ]
+    return json.dumps(results, indent=2)
+
+
+def search_result_is_failure(raw: str) -> bool:
+    """True if a backend's JSON output is empty or a failure placeholder."""
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return True
+    if not isinstance(data, list) or not data:
+        return True
+    first = data[0]
+    return isinstance(first, dict) and first.get("title") in _SEARCH_FAILURE_TITLES
+
+
+def search_with_fallback(query: str, backends: list[tuple[str, Any]]) -> str:
+    """Try each ``(name, callable)`` backend in order; return the first good result.
+
+    A backend fails if it raises or returns an empty/placeholder result.
+    If every backend fails, returns a single "No results found" placeholder
+    that names the backends tried.
+    """
+    tried: list[str] = []
+    for name, fn in backends:
+        tried.append(name)
+        try:
+            raw = fn(query)
+        except Exception as e:  # noqa: BLE001 - any backend failure -> next
+            logger.warning("web search backend %s failed: %s", name, type(e).__name__)
+            continue
+        if not search_result_is_failure(raw):
+            return raw
+        logger.info("web search backend %s returned no usable results", name)
+    return json.dumps([{
+        "title": "No results found",
+        "link": "",
+        "snippet": (
+            f'No web results found for "{query}" '
+            f"(tried: {', '.join(tried) or 'none'}). Try a different query."
+        ),
+    }], indent=2)
