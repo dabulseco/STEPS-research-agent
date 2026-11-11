@@ -16,7 +16,7 @@ Built with [CrewAI](https://github.com/crewAIInc/crewAI), [Ollama](https://ollam
 - **Persistent document library** — URLs and PDFs can be saved across sessions and retrieved in future research projects
 - **Six output formats** — Blog Post, Research Paper, Essay, Executive Summary, NSF-Style Grant Proposal, Explainer
 - **Configurable length** — 500 words to 5,000+ words with section-by-section writing for long outputs
-- **DOCX and Markdown export**
+- **DOCX and HTML export** — HTML is a standalone, sanitized page you can open in any browser
 
 ---
 
@@ -78,6 +78,7 @@ research_agentV4/
 ├── app.py              # Main Streamlit application
 ├── rag.py              # ChromaDB DocumentStore — chunking, embedding, retrieval
 ├── requirements.txt    # Python dependencies
+├── export_html.py      # Markdown -> sanitized standalone HTML export
 ├── user_manual.md      # Full user manual
 ├── README.md           # This file
 └── chroma_db/          # ChromaDB persistent store (git-ignored)

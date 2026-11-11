@@ -25,6 +25,7 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import streamlit as st
 from rag import DocumentStore, classify_embedding_models
+from export_html import markdown_to_html
 from tools import (
     ollama_web_search,
     search_with_fallback,
@@ -2890,6 +2891,10 @@ def main() -> None:
 
         # Generate DOCX bytes deterministically (no LLM needed)
         docx_bytes = _markdown_to_docx(st.session_state.written_output, title=fmt_label)
+        # Standalone, sanitized HTML page (replaces the old raw-markdown download)
+        html_bytes = markdown_to_html(
+            st.session_state.written_output, title=fmt_label
+        ).encode("utf-8")
 
         # Pull identifiers from the output and build bibliography strings
         # once so the two bibliography buttons can reuse them.
@@ -2911,10 +2916,10 @@ def main() -> None:
             )
         with col2:
             st.download_button(
-                "📥 Download Markdown",
-                st.session_state.written_output,
-                file_name=f"{safe_fmt}_{timestamp}.md",
-                mime="text/markdown",
+                "📥 Download HTML",
+                html_bytes,
+                file_name=f"{safe_fmt}_{timestamp}.html",
+                mime="text/html",
             )
         with col3:
             # BibTeX download — disabled when no identifiers were extracted.

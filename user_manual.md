@@ -255,7 +255,7 @@ The agent writes the complete document. A progress spinner shows which section i
 Once complete, the document is rendered as a markdown preview. Download options:
 
 - **Download DOCX** — a formatted Word document with proper heading styles, bold/italic runs, bullet lists, and 1-inch margins.
-- **Download Markdown** — the raw markdown source.
+- **Download HTML** — a standalone, self-contained web page (open it in any browser or print it to PDF). Any raw HTML in the output is sanitized, so scripts and other active content are stripped.
 
 Other actions:
 - **Redo Output** — regenerate the document without redoing the research.
